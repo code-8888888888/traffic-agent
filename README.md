@@ -1,10 +1,26 @@
 # traffic-agent
 
-A production-ready Go application that intercepts and inspects HTTP and HTTPS (TLS) network traffic at the kernel level using **eBPF**, without acting as a proxy or requiring changes to client applications.
+A Go application that passively intercepts and inspects HTTP network traffic at the kernel level using **eBPF**, without acting as a proxy or requiring any changes to client applications.
 
 ---
 
-## Architecture Overview
+## Table of Contents
+
+- [How It Works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [Building](#building)
+- [Running](#running)
+- [Configuration Reference](#configuration-reference)
+- [Output Format](#output-format)
+- [Event Streaming](#event-streaming)
+- [Systemd Installation](#systemd-installation)
+- [Required Capabilities](#required-capabilities)
+- [Makefile Targets](#makefile-targets)
+- [Known Limitations](#known-limitations)
+
+---
+
+## How It Works
 
 ```
                   ┌─────────────────────────────────────────────┐
@@ -25,13 +41,12 @@ A production-ready Go application that intercepts and inspects HTTP and HTTPS (T
                   │  └──────┬──────┘   └──────────┬──────────┘  │
                   │         │ RawPacketEvent        │ SSLEvent    │
                   │  ┌──────▼──────────────────────▼───────┐    │
-                  │  │          HTTP Parser (parser/)        │    │
-                  │  │     gopacket TCP reassembly +         │    │
-                  │  │     net/http request/response parse   │    │
+                  │  │       HTTP Parser (parser/)           │    │
+                  │  │  per-flow buffering + net/http parse  │    │
                   │  └─────────────────────┬─────────────────┘   │
                   │                        │ TrafficEvent         │
                   │              ┌─────────▼──────────┐          │
-                  │              │    Filter (filter/) │          │
+                  │              │   Filter (filter/)  │          │
                   │              └─────────┬──────────┘          │
                   │                        │                      │
                   │         ┌──────────────┼──────────────┐      │
@@ -43,18 +58,17 @@ A production-ready Go application that intercepts and inspects HTTP and HTTPS (T
                   └───────────────────────────────────────────────┘
 ```
 
-### eBPF Hook Types Used
+**TC (Traffic Control) hooks** are attached to both the ingress and egress paths of a network interface. Every TCP packet matching the configured ports passes through the BPF program, which copies the payload into a ring buffer. The Go userspace process reads from the ring buffer, accumulates per-flow payloads, and parses complete HTTP/1.1 request and response messages. Parsed events are filtered, then written as newline-delimited JSON.
 
-| Hook | Purpose | Why |
-|------|---------|-----|
-| **TC ingress** | Capture inbound TCP payload | Runs after NIC driver, before socket; sees all traffic including traffic not yet accepted |
-| **TC egress** | Capture outbound TCP payload | Runs before packet leaves the host; sees plaintext before kernel's TLS-offload (if any) |
-| **uprobe/SSL_write** + **uretprobe/SSL_write** | Save plaintext buf pointer on entry; capture after write returns | SSL_write data is plaintext *before* OpenSSL encrypts it |
-| **uprobe/SSL_read** + **uretprobe/SSL_read** | Save buf pointer; read plaintext on return | Buffer is populated *after* OpenSSL decrypts; must capture on uretprobe |
+| Hook | Direction | What is captured |
+|------|-----------|-----------------|
+| TC ingress | Inbound | Server → client responses (status code, headers, body) |
+| TC egress | Outbound | Client → server requests (method, URL, headers, body) |
+| uprobe SSL_write / SSL_read | Both | Plaintext before/after OpenSSL encryption (TLS interception, optional) |
 
 ---
 
-## Build Prerequisites
+## Prerequisites
 
 ### System packages
 
@@ -66,199 +80,448 @@ sudo apt-get install -y \
     linux-headers-$(uname -r) \
     linux-tools-$(uname -r)   # provides bpftool
 
-# Verify kernel BTF support (required)
+# Verify BTF support (required for CO-RE)
 ls /sys/kernel/btf/vmlinux
 ```
 
 ### Go toolchain
 
 ```bash
-# Go 1.22+
+# Go 1.22 or later
 go version
 
-# bpf2go (installed automatically via go generate)
+# Install bpf2go (used by go generate to compile eBPF C programs)
 go install github.com/cilium/ebpf/cmd/bpf2go@latest
 ```
 
 ### Kernel requirements
 
-- **Linux 5.8+** with `CONFIG_DEBUG_INFO_BTF=y` (for CO-RE support)
-- **Linux 5.11+** recommended (removes `RLIMIT_MEMLOCK` requirement for eBPF maps)
-- Verify: `uname -r && cat /boot/config-$(uname -r) | grep CONFIG_DEBUG_INFO_BTF`
+| Requirement | Minimum | Notes |
+|-------------|---------|-------|
+| Kernel version | 5.8 | CO-RE + BTF support |
+| Kernel version | 5.11 | Recommended — removes `RLIMIT_MEMLOCK` restriction |
+| `CONFIG_DEBUG_INFO_BTF` | `y` | Required for `vmlinux.h` generation |
+
+```bash
+# Check kernel version and BTF config
+uname -r
+grep CONFIG_DEBUG_INFO_BTF /boot/config-$(uname -r)
+```
 
 ---
 
-## Build Steps
+## Building
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/traffic-agent/traffic-agent
+# 1. Clone
+git clone https://github.com/code-8888888888/traffic-agent
 cd traffic-agent
 
-# 2. Generate vmlinux.h from the running kernel (one-time)
+# 2. Generate vmlinux.h from the running kernel (one-time per machine)
 make vmlinux
 
-# 3. Run go mod tidy to fetch dependencies
+# 3. Fetch Go dependencies
 make tidy
 
-# 4. Compile eBPF C programs and build the binary
+# 4. Compile eBPF C → Go objects, then build binary
 make build
-
 # Output: ./bin/traffic-agent
 ```
 
----
-
-## Installation
+To rebuild after changing only Go code (skips BPF recompilation):
 
 ```bash
-# Install binary, config, and systemd service
-sudo make install
-
-# Enable and start the service
-sudo systemctl enable --now traffic-agent
-
-# View logs
-sudo journalctl -u traffic-agent -f
+go build -o ./bin/traffic-agent ./cmd/agent
 ```
 
 ---
 
-## Configuration
+## Running
 
-The default config is installed to `/etc/traffic-agent/config.yaml`.
+```bash
+# Run directly (requires root or the capabilities listed below)
+sudo ./bin/traffic-agent --config config/config.yaml
+
+# Flags
+sudo ./bin/traffic-agent --help
+  -config string   path to config.yaml (default "/etc/traffic-agent/config.yaml")
+  -v               verbose logging
+```
+
+Traffic events are written as newline-delimited JSON to stdout (and optionally to a file). Log messages (startup, errors) go to stderr.
+
+```bash
+# Capture events to a file while watching logs in real time
+sudo ./bin/traffic-agent --config config/config.yaml \
+    > /var/log/traffic-agent/events.json \
+    2> /var/log/traffic-agent/agent.log
+```
+
+---
+
+## Configuration Reference
+
+The config file is YAML. The default path is `/etc/traffic-agent/config.yaml`; override with `--config`.
+
+All fields are optional — defaults are shown in the comments below.
 
 ```yaml
-# Network interface to monitor
-interface: eth0
+# -----------------------------------------------------------------------
+# Interface
+# -----------------------------------------------------------------------
 
-# TCP ports to capture
-ports: [80, 443, 8080, 8443]
+# Network interface to attach TC eBPF hooks to.
+# Run `ip link show` to find the correct name on your system.
+# Default: eth0
+interface: enp0s1
+
+
+# -----------------------------------------------------------------------
+# Port filter (BPF-level, applied before any userspace filtering)
+# -----------------------------------------------------------------------
+
+# TCP ports to capture. Only packets whose source OR destination port
+# matches one of these values are passed through the BPF program.
+# All other ports are ignored at the kernel level (zero overhead).
+# Default: [80, 443, 8080, 8443]
+ports:
+  - 80     # HTTP
+  - 443    # HTTPS
+  - 8080   # HTTP alternate
+  - 8443   # HTTPS alternate
+
+
+# -----------------------------------------------------------------------
+# Traffic filtering  (userspace, applied after BPF capture)
+# All rules are ANDed. An empty or omitted rule matches everything.
+# -----------------------------------------------------------------------
 
 filter:
-  # Filter by source/destination IP
-  # src_ips: ["10.0.0.1"]
-  # dst_ips: ["93.184.216.34"]
+  # Capture only packets from these source IP addresses.
+  # Accepts exact IPv4 addresses (CIDR notation not yet supported).
+  # Default: [] (match all sources)
+  # src_ips:
+  #   - 10.0.0.5
+  #   - 192.168.1.10
 
-  # Filter by process name
-  # processes: ["curl", "nginx"]
+  # Capture only packets destined for these IP addresses.
+  # Default: [] (match all destinations)
+  # dst_ips:
+  #   - 93.184.216.34
+
+  # Capture only packets from these source ports.
+  # Useful to pin to a specific client ephemeral port for debugging.
+  # Default: [] (match all source ports)
+  # src_ports:
+  #   - 54321
+
+  # Capture only packets destined for these ports.
+  # Narrows down within the BPF-level port list above.
+  # Default: [] (match all destination ports)
+  # dst_ports:
+  #   - 80
+
+  # Capture only traffic from these process IDs.
+  # PID filtering is best-effort; PIDs can be reused by the OS.
+  # Default: [] (match all processes)
+  # pids:
+  #   - 1234
+  #   - 5678
+
+  # Capture only traffic from processes with these names.
+  # Matched against the comm name (/proc/<pid>/comm, max 15 chars).
+  # Default: [] (match all process names)
+  # processes:
+  #   - curl
+  #   - nginx
+  #   - python3
+
+
+# -----------------------------------------------------------------------
+# Output / logging
+# -----------------------------------------------------------------------
 
 output:
+  # Write JSON events to stdout.
+  # Default: true (also forced true when no file is configured)
   stdout: true
-  file: /var/log/traffic-agent/events.json
+
+  # Write JSON events to a rotating log file.
+  # Leave empty to disable file logging.
+  # Default: "" (disabled)
+  # file: /var/log/traffic-agent/events.json
+
+  # Maximum size of the log file in megabytes before rotation.
+  # Default: 100
   max_size_mb: 100
+
+  # Maximum number of days to retain old rotated log files.
+  # 0 means retain indefinitely.
+  # Default: 7
   max_age_days: 7
+
+  # Maximum number of old rotated log files to keep.
+  # 0 means keep all.
+  # Default: 3
   max_backups: 3
-  compress: true
+
+  # Gzip-compress rotated log files to save disk space.
+  # Default: false
+  compress: false
+
+
+# -----------------------------------------------------------------------
+# TLS / SSL plaintext interception via eBPF uprobes  (optional)
+# Hooks into OpenSSL's SSL_read / SSL_write to capture plaintext
+# before encryption and after decryption — no certificate injection.
+# -----------------------------------------------------------------------
 
 tls:
-  enabled: false          # set true to enable SSL uprobe interception
-  # processes: ["nginx"]
+  # Enable SSL uprobe interception.
+  # Default: false
+  enabled: false
+
+  # Attach uprobes only to these process IDs.
+  # If empty (and enabled: true), attaches to all processes using libssl.
+  # Default: [] (all processes)
+  # pids:
+  #   - 1234
+
+  # Attach uprobes only to processes with these names.
+  # Default: [] (all processes)
+  # processes:
+  #   - nginx
+  #   - envoy
+
+  # Explicit path to libssl.so.
+  # Leave empty to auto-detect via /proc/<pid>/maps (recommended).
+  # Default: "" (auto-detect)
+  # libssl_path: /usr/lib/x86_64-linux-gnu/libssl.so.3
+
+
+# -----------------------------------------------------------------------
+# HTTP event streaming endpoint  (optional)
+# Exposes a local HTTP server that streams captured events as
+# newline-delimited JSON (ndjson) for downstream consumers.
+# -----------------------------------------------------------------------
 
 event_stream:
-  enabled: false          # set true to expose HTTP event stream
+  # Enable the streaming HTTP server.
+  # Default: false
+  enabled: false
+
+  # TCP address to listen on.
+  # Default: 127.0.0.1:8080
   address: "127.0.0.1:8080"
+
+  # HTTP path for the event stream.
+  # Default: /events
   path: /events
 ```
 
-### Stream events over HTTP
-
-```bash
-# Enable event_stream in config, then:
-curl -N http://127.0.0.1:8080/events
-```
-
 ---
 
-## Required Linux Capabilities
+## Output Format
 
-The agent must run with:
+Each captured HTTP transaction produces one or two JSON lines on stdout (and/or the log file): one for the **request** and one for the **response**.
 
-| Capability | Why |
-|-----------|-----|
-| `CAP_BPF` | Load and manage eBPF programs and maps |
-| `CAP_NET_ADMIN` | Attach TC filters to network interfaces |
-| `CAP_SYS_ADMIN` | Required for certain eBPF operations on kernels < 5.8 |
-| `CAP_SYS_PTRACE` | Read `/proc/<pid>/maps` for SSL uprobe symbol resolution |
-
-### Granting capabilities to the binary (non-root)
-
-```bash
-# Create a dedicated user
-useradd -r -s /sbin/nologin traffic-agent
-
-# Grant capabilities to the binary
-setcap 'cap_bpf,cap_net_admin,cap_sys_admin,cap_sys_ptrace+eip' \
-    /usr/local/bin/traffic-agent
-```
-
-Update `deploy/traffic-agent.service` to use `User=traffic-agent` with `AmbientCapabilities` (see commented section in the unit file).
-
----
-
-## Example Output (JSON)
+### Request event
 
 ```json
 {
-  "timestamp": "2026-02-21T10:15:30.123456Z",
-  "src_ip": "10.0.1.42",
-  "dst_ip": "93.184.216.34",
-  "src_port": 54321,
+  "timestamp": "2026-02-22T14:34:02.764229109Z",
+  "src_ip": "192.168.68.62",
+  "dst_ip": "44.195.71.76",
+  "src_port": 42126,
   "dst_port": 80,
   "protocol": "TCP",
   "direction": "egress",
-  "pid": 12345,
-  "process_name": "curl",
-  "http_method": "GET",
-  "url": "/index.html",
-  "status_code": 0,
+  "http_method": "POST",
+  "url": "/api/data",
   "request_headers": {
+    "Accept": "*/*",
+    "Content-Length": "17",
+    "Content-Type": "application/json",
     "Host": "example.com",
-    "User-Agent": "curl/8.5.0",
-    "Accept": "*/*"
+    "User-Agent": "curl/7.81.0"
   },
-  "body_snippet": ""
+  "body_snippet": "{\"hello\":\"world\"}"
 }
 ```
+
+### Response event
+
+```json
+{
+  "timestamp": "2026-02-22T14:34:02.981524882Z",
+  "src_ip": "44.195.71.76",
+  "dst_ip": "192.168.68.62",
+  "src_port": 80,
+  "dst_port": 42126,
+  "protocol": "TCP",
+  "direction": "ingress",
+  "status_code": 200,
+  "response_headers": {
+    "Content-Length": "256",
+    "Content-Type": "application/json",
+    "Date": "Sun, 22 Feb 2026 14:34:02 GMT",
+    "Server": "gunicorn/19.9.0"
+  },
+  "body_snippet": "{\n  \"args\": {},\n  \"origin\": \"103.157.123.210\"\n}\n"
+}
+```
+
+### Field reference
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `timestamp` | string (RFC3339Nano) | Wall-clock time the event was emitted |
+| `src_ip` | string | Source IPv4 address |
+| `dst_ip` | string | Destination IPv4 address |
+| `src_port` | number | Source TCP port |
+| `dst_port` | number | Destination TCP port |
+| `protocol` | string | Always `"TCP"` for TC-captured events |
+| `direction` | string | `"egress"` (outbound request) or `"ingress"` (inbound response) |
+| `http_method` | string | HTTP method (`GET`, `POST`, …) — requests only |
+| `url` | string | Request path and query string — requests only |
+| `request_headers` | object | All HTTP request headers including `Host` — requests only |
+| `status_code` | number | HTTP response status code — responses only |
+| `response_headers` | object | All HTTP response headers — responses only |
+| `body_snippet` | string | First 512 bytes of the request or response body (omitted if empty) |
+| `pid` | number | Process ID (populated for SSL-uprobe events; omitted for TC events) |
+| `process_name` | string | Process name (populated for SSL-uprobe events; omitted for TC events) |
+| `tls_intercepted` | bool | `true` when the payload came from an SSL uprobe (omitted otherwise) |
+
+---
+
+## Event Streaming
+
+Enable the streaming endpoint in config, then subscribe with any HTTP client:
+
+```yaml
+event_stream:
+  enabled: true
+  address: "127.0.0.1:9000"
+  path: /events
+```
+
+```bash
+# Subscribe — events arrive as newline-delimited JSON
+curl -N http://127.0.0.1:9000/events
+
+# Pipe into jq for pretty-printing
+curl -sN http://127.0.0.1:9000/events | jq .
+
+# Filter to POST requests only
+curl -sN http://127.0.0.1:9000/events | jq 'select(.http_method == "POST")'
+```
+
+Multiple concurrent subscribers are supported; each receives all events independently.
+
+---
+
+## Systemd Installation
+
+```bash
+# Build and install binary, default config, and service unit
+sudo make install
+
+# Enable and start
+sudo systemctl enable --now traffic-agent
+
+# Check status
+sudo systemctl status traffic-agent
+
+# Follow logs
+sudo journalctl -u traffic-agent -f
+
+# Reload config (restart required — no hot reload)
+sudo systemctl restart traffic-agent
+
+# Uninstall (config and logs are preserved)
+sudo make uninstall
+```
+
+`make install` installs to:
+
+| Path | Contents |
+|------|----------|
+| `/usr/local/bin/traffic-agent` | Binary |
+| `/etc/traffic-agent/config.yaml` | Default config (only if not already present) |
+| `/var/log/traffic-agent/` | Log directory |
+| `/etc/systemd/system/traffic-agent.service` | Systemd unit |
+
+---
+
+## Required Capabilities
+
+The agent requires elevated privileges to load eBPF programs and attach TC filters.
+
+| Capability | Required for |
+|-----------|-------------|
+| `CAP_BPF` | Loading eBPF programs and creating maps |
+| `CAP_NET_ADMIN` | Attaching TC filters to network interfaces |
+| `CAP_SYS_ADMIN` | eBPF operations on kernels older than 5.8 |
+| `CAP_SYS_PTRACE` | Reading `/proc/<pid>/maps` for SSL uprobe symbol resolution |
+
+### Option 1: Run as root (default)
+
+The systemd unit runs as `root` by default. No additional setup is required.
+
+### Option 2: Dedicated user with ambient capabilities
+
+```bash
+# Create a dedicated system user
+sudo useradd -r -s /sbin/nologin traffic-agent
+
+# Grant capabilities to the binary
+sudo setcap 'cap_bpf,cap_net_admin,cap_sys_admin,cap_sys_ptrace+eip' \
+    /usr/local/bin/traffic-agent
+```
+
+Then edit `/etc/systemd/system/traffic-agent.service` and uncomment the capability block:
+
+```ini
+User=traffic-agent
+Group=traffic-agent
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
+```
+
+---
+
+## Makefile Targets
+
+| Target | Description |
+|--------|-------------|
+| `make build` | Compile eBPF C programs and build the binary to `./bin/traffic-agent` |
+| `make generate` | Compile BPF C → Go-embedded objects only (runs `bpf2go`) |
+| `make vmlinux` | Generate `bpf/headers/vmlinux.h` from the running kernel's BTF |
+| `make tidy` | Run `go mod tidy` |
+| `make install` | Install binary, config, and systemd service (requires root) |
+| `make uninstall` | Remove installed binary and service (preserves config and logs) |
+| `make lint` | Run `golangci-lint` |
+| `make test` | Run unit tests with race detector |
+| `make clean` | Remove `./bin/` and generated eBPF Go bindings |
 
 ---
 
 ## Known Limitations
 
-1. **eBPF map sizes** — The ring buffer is 256 KiB for TC events and 512 KiB for SSL events. Under high traffic load, events may be dropped. Increase `max_entries` in the BPF map definitions and recompile.
+1. **IPv4 only** — The TC BPF program skips non-`ETH_P_IP` frames. IPv6 support requires adding `ip6hdr` parsing.
 
-2. **TCP reassembly** — The TC capture passes individual packets; gopacket's reassembler handles reordering but requires buffering. Long-lived HTTP/1.1 keep-alive streams with many requests may consume memory.
+2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. HTTPS traffic captured via SSL uprobes would need an additional HTTP/2 framing layer.
 
-3. **HTTP/2 not supported** — HTTP/2 uses binary framing (HPACK). Parsing is stubbed out. HTTPS/2 captured via SSL uprobes contains raw TLS record data that would need an additional HTTP/2 framing parser.
+3. **TCP sequence numbers not captured** — Payloads are accumulated in arrival order. Out-of-order segment reassembly is not supported. In practice, in-order delivery is the common case on local networks.
 
-4. **Go TLS interception** — Go's standard library (`crypto/tls`) does not link against OpenSSL. The SSL uprobes do **not** intercept Go HTTPS clients/servers. A separate set of uretprobes on `crypto/tls.(*Conn).Read` / `Write` is planned (see TODO in `bpf/ssl_uprobe.c`).
+4. **Body snippet limit** — At most 512 bytes of the request or response body are captured per event (`BodySnippetMaxLen` in `internal/types/types.go`). Large bodies are truncated.
 
-5. **Container/namespace support** — The TC hook attaches to the host network interface. Traffic inside containers using network namespaces (e.g. Docker bridge) will be captured at the veth level. Attaching to individual container veth pairs requires additional logic.
+5. **BPF ring buffer size** — The TC ring buffer is 256 KiB (`max_entries` in `bpf/tc_capture.c`). Under sustained high throughput, events may be dropped. Increase `max_entries` and recompile if needed.
 
-6. **Kernel version** — Tested on Linux 5.15+. CO-RE requires kernel 5.8+ with BTF. The stub `vmlinux.h` allows compilation but the eBPF verifier may reject programs if the real BTF types differ significantly.
+6. **Go TLS not intercepted** — Go's `crypto/tls` does not link against OpenSSL, so the SSL uprobes do not cover Go HTTPS clients or servers. A separate uretprobe on `crypto/tls.(*Conn).Read/Write` is planned.
 
-7. **IPv6** — Currently only IPv4 is parsed in the TC program. IPv6 support is straightforward to add by checking `ETH_P_IPV6` and parsing `ip6hdr`.
+7. **Per-interface attachment** — TC hooks attach to one interface. Capture on multiple interfaces requires running multiple instances with different configs, or extending the code to iterate over interfaces.
 
----
+8. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
 
-## Development
-
-```bash
-# Run linter
-make lint
-
-# Run tests
-make test
-
-# Clean generated files
-make clean
-
-# Regenerate everything from scratch
-make vmlinux && make generate && make build
-```
-
----
-
-## License
-
-Apache 2.0 — see [LICENSE](LICENSE).
+9. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
