@@ -119,6 +119,22 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 	}
 	defer req.Body.Close()
 
+	// Read available body bytes (up to snippet limit).
+	bodyBuf := make([]byte, types.BodySnippetMaxLen)
+	bodyN, _ := io.ReadAtLeast(req.Body, bodyBuf, 1)
+	if bodyN < 0 {
+		bodyN = 0
+	}
+
+	// If Content-Length is known and we haven't received all of it (and
+	// haven't yet filled the snippet buffer), wait for the next segment.
+	contentLen := int(req.ContentLength)
+	bodyComplete := contentLen <= 0 || bodyN >= contentLen
+	snippetFull := bodyN >= types.BodySnippetMaxLen
+	if !bodyComplete && !snippetFull {
+		return
+	}
+
 	reqHeaders := headersToMap(req.Header)
 	if req.Host != "" {
 		reqHeaders["Host"] = req.Host
@@ -135,8 +151,8 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 		URL:            req.URL.String(),
 		RequestHeaders: reqHeaders,
 	}
-	if body := readBodySnippet(req.Body); len(body) > 0 {
-		te.BodySnippet = string(body)
+	if bodyN > 0 {
+		te.BodySnippet = string(bodyBuf[:bodyN])
 	}
 	p.sink(te)
 	p.deleteBuf(key)
@@ -209,14 +225,3 @@ func headersToMap(h http.Header) map[string]string {
 	return m
 }
 
-func readBodySnippet(body io.ReadCloser) []byte {
-	if body == nil || body == http.NoBody {
-		return nil
-	}
-	buf := make([]byte, types.BodySnippetMaxLen)
-	n, _ := body.Read(buf)
-	if n <= 0 {
-		return nil
-	}
-	return buf[:n]
-}
