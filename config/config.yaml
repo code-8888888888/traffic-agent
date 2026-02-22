@@ -69,7 +69,7 @@ output:
 # -----------------------------------------------------------------------
 tls:
   # Enable SSL_read / SSL_write uprobe interception.
-  enabled: false
+  enabled: true
 
   # Attach only to these PIDs. Empty = attach to all processes using libssl.
   # pids:

@@ -86,6 +86,13 @@ func (i *Interceptor) Start(events chan<- *types.SSLEvent) error {
 		}
 	}
 
+	// If no specific targets configured, attach globally (PID=0 = all processes).
+	if len(i.cfg.PIDs) == 0 && len(i.cfg.Processes) == 0 {
+		if err := i.attachGlobal(); err != nil {
+			log.Printf("[tls] global attach error: %v", err)
+		}
+	}
+
 	var err error
 	i.reader, err = ringbuf.NewReader(i.objs.SSLUprobeMaps.SslEvents)
 	if err != nil {
@@ -154,6 +161,65 @@ func (i *Interceptor) attachToPID(pid int) error {
 	}
 
 	log.Printf("[tls] attached SSL uprobes to PID %d (%s)", pid, libPath)
+	return nil
+}
+
+// attachGlobal attaches SSL uprobes system-wide (PID=0) to libssl.so.
+// Used when no specific PIDs or process names are configured.
+func (i *Interceptor) attachGlobal() error {
+	libPath := i.cfg.LibSSLPath
+	if libPath == "" {
+		candidates := []string{
+			"/usr/lib/aarch64-linux-gnu/libssl.so.3",
+			"/usr/lib/x86_64-linux-gnu/libssl.so.3",
+			"/usr/lib/libssl.so.3",
+			"/usr/lib/aarch64-linux-gnu/libssl.so",
+			"/usr/lib/x86_64-linux-gnu/libssl.so",
+		}
+		for _, c := range candidates {
+			if _, err := os.Stat(c); err == nil {
+				libPath = c
+				break
+			}
+		}
+	}
+	if libPath == "" {
+		return fmt.Errorf("libssl.so not found; set tls.libssl_path in config")
+	}
+
+	ex, err := link.OpenExecutable(libPath)
+	if err != nil {
+		return fmt.Errorf("open executable %s: %w", libPath, err)
+	}
+
+	probes := []struct {
+		sym  string
+		prog *ebpf.Program
+		ret  bool
+	}{
+		{"SSL_write", i.objs.UprobeSslWriteEntry, false},
+		{"SSL_write", i.objs.UretprobeSslWriteRet, true},
+		{"SSL_read", i.objs.UprobeSslReadEntry, false},
+		{"SSL_read", i.objs.UretprobeSslReadRet, true},
+	}
+
+	// PID=0 (omitted from opts) means system-wide — intercepts all processes
+	// that call into this libssl.so.
+	for _, p := range probes {
+		var l link.Link
+		var err error
+		if p.ret {
+			l, err = ex.Uretprobe(p.sym, p.prog, nil)
+		} else {
+			l, err = ex.Uprobe(p.sym, p.prog, nil)
+		}
+		if err != nil {
+			return fmt.Errorf("attach global uprobe %s (ret=%v): %w", p.sym, p.ret, err)
+		}
+		i.links = append(i.links, l)
+	}
+
+	log.Printf("[tls] attached global SSL uprobes to %s", libPath)
 	return nil
 }
 

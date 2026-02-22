@@ -129,8 +129,6 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	copy(data, fb.data)
 	p.mu.Unlock()
 
-	ts := time.Unix(0, int64(ev.TimestampNS))
-
 	if !ev.IsRead {
 		// SSL_write: process is sending plaintext → HTTP request (egress).
 		fields, ok := parseHTTPRequestFields(data)
@@ -138,7 +136,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 			return
 		}
 		te := &types.TrafficEvent{
-			Timestamp:      ts,
+			Timestamp:      time.Now(),
 			Protocol:       "TLS",
 			Direction:      "egress",
 			PID:            ev.PID,
@@ -158,7 +156,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 			return
 		}
 		te := &types.TrafficEvent{
-			Timestamp:       ts,
+			Timestamp:       time.Now(),
 			Protocol:        "TLS",
 			Direction:       "ingress",
 			PID:             ev.PID,
