@@ -1,6 +1,9 @@
 # traffic-agent
 
-A Go application that passively intercepts and inspects HTTP network traffic at the kernel level using **eBPF**, without acting as a proxy or requiring any changes to client applications.
+A Go application that passively intercepts and inspects **HTTP and HTTPS** network traffic at the kernel level using **eBPF**, without acting as a proxy or requiring any changes to client applications.
+
+- **HTTP** — captured via TC (Traffic Control) eBPF hooks on the network interface
+- **HTTPS** — captured via eBPF uprobes on OpenSSL's `SSL_read`/`SSL_write`, intercepting plaintext before encryption and after decryption with no certificate injection or MITM
 
 ---
 
@@ -10,6 +13,7 @@ A Go application that passively intercepts and inspects HTTP network traffic at 
 - [Prerequisites](#prerequisites)
 - [Building](#building)
 - [Running](#running)
+- [HTTPS / TLS Interception](#https--tls-interception)
 - [Configuration Reference](#configuration-reference)
 - [Output Format](#output-format)
 - [Event Streaming](#event-streaming)
@@ -156,6 +160,84 @@ sudo ./bin/traffic-agent --config config/config.yaml \
     > /var/log/traffic-agent/events.json \
     2> /var/log/traffic-agent/agent.log
 ```
+
+---
+
+## HTTPS / TLS Interception
+
+The agent hooks into OpenSSL's `SSL_write` and `SSL_read` functions via eBPF uprobes to capture plaintext **before encryption** (outbound) and **after decryption** (inbound). No certificate injection, no MITM proxy, and no changes to the client are required.
+
+### How it works
+
+```
+curl → SSL_write(plaintext request) → [uprobe fires, copies to ring buffer]
+                                     → OpenSSL encrypts → sends over wire
+
+wire → OpenSSL decrypts → SSL_read(plaintext response) → [uprobe fires, copies to ring buffer]
+```
+
+The captured plaintext is fed into the same HTTP/1.1 parser as TC-captured traffic, producing `TrafficEvent` JSON with `"protocol": "TLS"` and `"tls_intercepted": true`.
+
+### Enabling TLS interception
+
+Set `tls.enabled: true` in `config.yaml` (it is enabled in the default config):
+
+```yaml
+tls:
+  enabled: true
+  # No pids or processes = attach globally to all processes using libssl.so
+```
+
+When no `pids` or `processes` are specified, the agent attaches system-wide to `libssl.so.3`, intercepting all processes that use OpenSSL on the machine.
+
+### Testing
+
+```bash
+# Start the agent
+sudo ./bin/traffic-agent --config config/config.yaml
+
+# In another terminal — use --http1.1 to avoid HTTP/2 binary framing
+curl --http1.1 https://httpbin.org/get
+curl --http1.1 https://httpbin.org/post -H 'Content-Type: application/json' -d '{"hello":"world"}'
+```
+
+### Example output
+
+```json
+{"timestamp":"2026-02-22T14:58:39.270923093Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":349147,"process_name":"curl","http_method":"POST","url":"/post","request_headers":{"Accept":"*/*","Content-Length":"17","Content-Type":"application/json","Host":"httpbin.org","User-Agent":"curl/7.81.0"},"body_snippet":"{\"hello\":\"world\"}","tls_intercepted":true}
+{"timestamp":"2026-02-22T14:58:39.798016124Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":349147,"process_name":"curl","status_code":200,"response_headers":{"Content-Length":"434","Content-Type":"application/json","Server":"gunicorn/19.9.0"},"body_snippet":"{\n  \"data\": \"{\\\"hello\\\":\\\"world\\\"}\", ...}","tls_intercepted":true}
+```
+
+> **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
+
+### HTTP/2 caveat
+
+By default, curl negotiates HTTP/2 for HTTPS connections. HTTP/2 uses binary HPACK framing which is not parseable by the HTTP/1.1 parser. Force HTTP/1.1 to get clean events:
+
+```bash
+curl --http1.1 https://example.com/api
+```
+
+HTTP/2 support is tracked in [Known Limitations](#known-limitations).
+
+### Target-specific attachment
+
+To intercept only a specific process rather than all SSL traffic:
+
+```yaml
+tls:
+  enabled: true
+  processes:
+    - nginx      # attach only to processes named "nginx"
+    - python3
+  # or by PID:
+  # pids:
+  #   - 1234
+```
+
+### Go TLS limitation
+
+Go programs use the built-in `crypto/tls` package, which does **not** link against OpenSSL. SSL uprobes do not cover Go HTTPS clients or servers. See [Known Limitations](#known-limitations).
 
 ---
 
@@ -380,7 +462,7 @@ Each captured HTTP transaction produces one or two JSON lines on stdout (and/or 
 | `dst_ip` | string | Destination IPv4 address |
 | `src_port` | number | Source TCP port |
 | `dst_port` | number | Destination TCP port |
-| `protocol` | string | Always `"TCP"` for TC-captured events |
+| `protocol` | string | `"TCP"` for TC-captured events; `"TLS"` for SSL-uprobe events |
 | `direction` | string | `"egress"` (outbound request) or `"ingress"` (inbound response) |
 | `http_method` | string | HTTP method (`GET`, `POST`, …) — requests only |
 | `url` | string | Request path and query string — requests only |
@@ -510,7 +592,7 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
 
 1. **IPv4 only** — The TC BPF program skips non-`ETH_P_IP` frames. IPv6 support requires adding `ip6hdr` parsing.
 
-2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. HTTPS traffic captured via SSL uprobes would need an additional HTTP/2 framing layer.
+2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. When using SSL uprobes with curl, pass `--http1.1` to force HTTP/1.1 negotiation. HTTP/2 support would require an additional HPACK framing layer on top of the SSL uprobe capture path.
 
 3. **TCP sequence numbers not captured** — Payloads are accumulated in arrival order. Out-of-order segment reassembly is not supported. In practice, in-order delivery is the common case on local networks.
 
