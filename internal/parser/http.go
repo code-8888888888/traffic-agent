@@ -1,9 +1,10 @@
 // Package parser performs HTTP/1.1 parsing on raw packet payloads captured by
-// the TC eBPF program.
+// the TC eBPF program and on plaintext data captured by SSL uprobes.
 //
 // Architecture:
 //
-//	RawPacketEvent  →  HandlePacket  →  per-flow buffer  →  TrafficEvent
+//	RawPacketEvent  →  HandlePacket   →  per-flow buffer  →  TrafficEvent
+//	SSLEvent        →  HandleSSLEvent →  per-flow buffer  →  TrafficEvent
 //
 // Payloads are accumulated in a per-flow (4-tuple) ring until a complete HTTP
 // message can be parsed. For responses, the event is held back until the body
@@ -40,6 +41,13 @@ type flowKey struct {
 	dstPort uint16
 }
 
+// sslFlowKey identifies a per-thread SSL data stream.
+type sslFlowKey struct {
+	PID    uint32
+	TID    uint32
+	IsRead bool
+}
+
 type flowBuf struct {
 	data    []byte
 	updated time.Time
@@ -47,16 +55,18 @@ type flowBuf struct {
 
 // Parser accumulates per-flow payloads and emits HTTP traffic events.
 type Parser struct {
-	sink EventSink
-	mu   sync.Mutex
-	bufs map[flowKey]*flowBuf
+	sink    EventSink
+	mu      sync.Mutex
+	bufs    map[flowKey]*flowBuf
+	sslBufs map[sslFlowKey]*flowBuf
 }
 
 // New creates a Parser that will call sink for each parsed HTTP event.
 func New(sink EventSink) *Parser {
 	return &Parser{
-		sink: sink,
-		bufs: make(map[flowKey]*flowBuf),
+		sink:    sink,
+		bufs:    make(map[flowKey]*flowBuf),
+		sslBufs: make(map[sslFlowKey]*flowBuf),
 	}
 }
 
@@ -96,6 +106,73 @@ func (p *Parser) HandlePacket(ev *types.RawPacketEvent) {
 	}
 }
 
+// HandleSSLEvent appends ev.Data to the per-SSL-stream buffer and attempts to
+// parse a complete HTTP request or response from the accumulated plaintext.
+func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
+	if len(ev.Data) == 0 {
+		return
+	}
+
+	key := sslFlowKey{PID: ev.PID, TID: ev.TID, IsRead: ev.IsRead}
+
+	p.mu.Lock()
+	fb, ok := p.sslBufs[key]
+	if !ok {
+		fb = &flowBuf{}
+		p.sslBufs[key] = fb
+	}
+	if len(fb.data)+len(ev.Data) <= maxFlowBufSize {
+		fb.data = append(fb.data, ev.Data...)
+	}
+	fb.updated = time.Now()
+	data := make([]byte, len(fb.data))
+	copy(data, fb.data)
+	p.mu.Unlock()
+
+	ts := time.Unix(0, int64(ev.TimestampNS))
+
+	if !ev.IsRead {
+		// SSL_write: process is sending plaintext → HTTP request (egress).
+		fields, ok := parseHTTPRequestFields(data)
+		if !ok {
+			return
+		}
+		te := &types.TrafficEvent{
+			Timestamp:      ts,
+			Protocol:       "TLS",
+			Direction:      "egress",
+			PID:            ev.PID,
+			ProcessName:    ev.ProcessName,
+			HTTPMethod:     fields.method,
+			URL:            fields.url,
+			RequestHeaders: fields.headers,
+			BodySnippet:    fields.body,
+			TLSIntercepted: true,
+		}
+		p.sink(te)
+		p.deleteSSLBuf(key)
+	} else {
+		// SSL_read: process is receiving plaintext → HTTP response (ingress).
+		fields, ok := parseHTTPResponseFields(data)
+		if !ok {
+			return
+		}
+		te := &types.TrafficEvent{
+			Timestamp:       ts,
+			Protocol:        "TLS",
+			Direction:       "ingress",
+			PID:             ev.PID,
+			ProcessName:     ev.ProcessName,
+			StatusCode:      fields.statusCode,
+			ResponseHeaders: fields.headers,
+			BodySnippet:     fields.body,
+			TLSIntercepted:  true,
+		}
+		p.sink(te)
+		p.deleteSSLBuf(key)
+	}
+}
+
 // FlushExpired removes stale flow buffers that have been idle longer than
 // olderThan. Call this periodically to prevent unbounded memory growth.
 func (p *Parser) FlushExpired(olderThan time.Duration) {
@@ -107,19 +184,95 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 			delete(p.bufs, key)
 		}
 	}
+	for key, fb := range p.sslBufs {
+		if fb.updated.Before(cutoff) {
+			delete(p.sslBufs, key)
+		}
+	}
 }
 
-// ---- Internal parse helpers ----
+// ---- Internal parse helpers (TC packet events) ----
 
 func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEvent) {
+	fields, ok := parseHTTPRequestFields(data)
+	if !ok {
+		return
+	}
+	te := &types.TrafficEvent{
+		Timestamp:      time.Now(),
+		SrcIP:          ev.SrcIP.String(),
+		DstIP:          ev.DstIP.String(),
+		SrcPort:        ev.SrcPort,
+		DstPort:        ev.DstPort,
+		Protocol:       "TCP",
+		Direction:      ev.Direction.String(),
+		HTTPMethod:     fields.method,
+		URL:            fields.url,
+		RequestHeaders: fields.headers,
+		BodySnippet:    fields.body,
+	}
+	p.sink(te)
+	p.deleteBuf(key)
+}
+
+func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketEvent) {
+	fields, ok := parseHTTPResponseFields(data)
+	if !ok {
+		return
+	}
+	te := &types.TrafficEvent{
+		Timestamp:       time.Now(),
+		SrcIP:           ev.SrcIP.String(),
+		DstIP:           ev.DstIP.String(),
+		SrcPort:         ev.SrcPort,
+		DstPort:         ev.DstPort,
+		Protocol:        "TCP",
+		Direction:       ev.Direction.String(),
+		StatusCode:      fields.statusCode,
+		ResponseHeaders: fields.headers,
+		BodySnippet:     fields.body,
+	}
+	p.sink(te)
+	p.deleteBuf(key)
+}
+
+func (p *Parser) deleteBuf(key flowKey) {
+	p.mu.Lock()
+	delete(p.bufs, key)
+	p.mu.Unlock()
+}
+
+func (p *Parser) deleteSSLBuf(key sslFlowKey) {
+	p.mu.Lock()
+	delete(p.sslBufs, key)
+	p.mu.Unlock()
+}
+
+// ---- Shared HTTP parsing helpers ----
+
+type httpRequestFields struct {
+	method  string
+	url     string
+	headers map[string]string
+	body    string
+}
+
+type httpResponseFields struct {
+	statusCode int
+	headers    map[string]string
+	body       string
+}
+
+// parseHTTPRequestFields attempts to parse an HTTP/1.1 request from data.
+// Returns (nil, false) if the message is incomplete or not HTTP.
+func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	r := bufio.NewReader(bytes.NewReader(data))
 	req, err := http.ReadRequest(r)
 	if err != nil {
-		return
+		return nil, false
 	}
 	defer req.Body.Close()
 
-	// Read available body bytes (up to snippet limit).
 	bodyBuf := make([]byte, types.BodySnippetMaxLen)
 	bodyN, _ := io.ReadAtLeast(req.Body, bodyBuf, 1)
 	if bodyN < 0 {
@@ -132,42 +285,38 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 	bodyComplete := contentLen <= 0 || bodyN >= contentLen
 	snippetFull := bodyN >= types.BodySnippetMaxLen
 	if !bodyComplete && !snippetFull {
-		return
+		return nil, false
 	}
 
-	reqHeaders := headersToMap(req.Header)
+	headers := headersToMap(req.Header)
 	if req.Host != "" {
-		reqHeaders["Host"] = req.Host
+		headers["Host"] = req.Host
 	}
-	te := &types.TrafficEvent{
-		Timestamp:      time.Now(),
-		SrcIP:          ev.SrcIP.String(),
-		DstIP:          ev.DstIP.String(),
-		SrcPort:        ev.SrcPort,
-		DstPort:        ev.DstPort,
-		Protocol:       "TCP",
-		Direction:      ev.Direction.String(),
-		HTTPMethod:     req.Method,
-		URL:            req.URL.String(),
-		RequestHeaders: reqHeaders,
-	}
+
+	body := ""
 	if bodyN > 0 {
-		te.BodySnippet = string(bodyBuf[:bodyN])
+		body = string(bodyBuf[:bodyN])
 	}
-	p.sink(te)
-	p.deleteBuf(key)
+
+	return &httpRequestFields{
+		method:  req.Method,
+		url:     req.URL.String(),
+		headers: headers,
+		body:    body,
+	}, true
 }
 
-func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketEvent) {
+// parseHTTPResponseFields attempts to parse an HTTP/1.1 response from data.
+// Returns (nil, false) if the message is incomplete or not HTTP.
+func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 	r := bufio.NewReader(bytes.NewReader(data))
 	resp, err := http.ReadResponse(r, nil)
 	if err != nil {
 		// Headers not yet fully buffered — keep accumulating.
-		return
+		return nil, false
 	}
 	defer resp.Body.Close()
 
-	// Read available body bytes (up to snippet limit).
 	bodyBuf := make([]byte, types.BodySnippetMaxLen)
 	bodyN, _ := io.ReadAtLeast(resp.Body, bodyBuf, 1)
 	if bodyN < 0 {
@@ -180,31 +329,19 @@ func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketE
 	bodyComplete := contentLen < 0 || bodyN >= contentLen
 	snippetFull := bodyN >= types.BodySnippetMaxLen
 	if !bodyComplete && !snippetFull {
-		return
+		return nil, false
 	}
 
-	te := &types.TrafficEvent{
-		Timestamp:       time.Now(),
-		SrcIP:           ev.SrcIP.String(),
-		DstIP:           ev.DstIP.String(),
-		SrcPort:         ev.SrcPort,
-		DstPort:         ev.DstPort,
-		Protocol:        "TCP",
-		Direction:       ev.Direction.String(),
-		StatusCode:      resp.StatusCode,
-		ResponseHeaders: headersToMap(resp.Header),
-	}
+	body := ""
 	if bodyN > 0 {
-		te.BodySnippet = string(bodyBuf[:bodyN])
+		body = string(bodyBuf[:bodyN])
 	}
-	p.sink(te)
-	p.deleteBuf(key)
-}
 
-func (p *Parser) deleteBuf(key flowKey) {
-	p.mu.Lock()
-	delete(p.bufs, key)
-	p.mu.Unlock()
+	return &httpResponseFields{
+		statusCode: resp.StatusCode,
+		headers:    headersToMap(resp.Header),
+		body:       body,
+	}, true
 }
 
 // ---- Helpers ----
@@ -224,4 +361,3 @@ func headersToMap(h http.Header) map[string]string {
 	}
 	return m
 }
-

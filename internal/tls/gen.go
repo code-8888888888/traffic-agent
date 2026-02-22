@@ -18,4 +18,4 @@ package tls
 //   sslUprobeObjects.Programs.UretprobeSSLRead  (*ebpf.Program)
 //   sslUprobeObjects.Maps.SslEvents             (*ebpf.Map)
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_arm64" SSLUprobe ../../bpf/ssl_uprobe.c -- -I../../bpf/headers
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_arm64 -mcpu=v3" SSLUprobe ../../bpf/ssl_uprobe.c -- -I../../bpf/headers

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -284,26 +283,3 @@ func findPIDsByName(names []string) ([]int, error) {
 	return pids, nil
 }
 
-// SSLEventToTrafficEvent converts a raw SSL event into a TrafficEvent.
-// SrcIP/DstIP are not available at this stage; they will be empty.
-func SSLEventToTrafficEvent(ev *types.SSLEvent) *types.TrafficEvent {
-	snippet := string(ev.Data)
-	if len(snippet) > types.BodySnippetMaxLen {
-		snippet = snippet[:types.BodySnippetMaxLen]
-	}
-
-	direction := "egress"
-	if ev.IsRead {
-		direction = "ingress"
-	}
-
-	return &types.TrafficEvent{
-		Timestamp:      time.Unix(0, int64(ev.TimestampNS)),
-		Protocol:       "TLS",
-		Direction:      direction,
-		PID:            ev.PID,
-		ProcessName:    ev.ProcessName,
-		BodySnippet:    snippet,
-		TLSIntercepted: true,
-	}
-}

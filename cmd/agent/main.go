@@ -122,8 +122,7 @@ func main() {
 
 			go func() {
 				for sslEv := range sslEventCh {
-					ev := tls.SSLEventToTrafficEvent(sslEv)
-					sink(ev)
+					p.HandleSSLEvent(sslEv)
 				}
 			}()
 		}
