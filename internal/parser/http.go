@@ -119,6 +119,10 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 	}
 	defer req.Body.Close()
 
+	reqHeaders := headersToMap(req.Header)
+	if req.Host != "" {
+		reqHeaders["Host"] = req.Host
+	}
 	te := &types.TrafficEvent{
 		Timestamp:      time.Now(),
 		SrcIP:          ev.SrcIP.String(),
@@ -129,7 +133,7 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 		Direction:      ev.Direction.String(),
 		HTTPMethod:     req.Method,
 		URL:            req.URL.String(),
-		RequestHeaders: headersToMap(req.Header),
+		RequestHeaders: reqHeaders,
 	}
 	if body := readBodySnippet(req.Body); len(body) > 0 {
 		te.BodySnippet = string(body)
