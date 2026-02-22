@@ -1,0 +1,52 @@
+[Unit]
+Description=eBPF Network Traffic Interception Agent
+Documentation=https://github.com/traffic-agent/traffic-agent
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/traffic-agent --config /etc/traffic-agent/config.yaml
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+# Run as root (required for eBPF and TC attach).
+# For a capability-based approach, see the commented block below.
+User=root
+Group=root
+
+# --- Capability-based alternative (requires ambient capabilities) ---
+# User=traffic-agent
+# Group=traffic-agent
+# AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
+# CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
+
+# Security hardening
+NoNewPrivileges=no          # must be no to allow eBPF program loading
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/traffic-agent /etc/traffic-agent
+
+# Allow loading eBPF programs and manipulating network interfaces
+SystemCallFilter=@system-service @network-io @privileged
+SystemCallErrorNumber=EPERM
+
+# Resource limits
+LimitNOFILE=65536
+LimitMEMLOCK=infinity       # required for eBPF map allocation on older kernels
+
+# Logging to journald (stdout/stderr captured automatically by systemd)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=traffic-agent
+
+# Environment
+Environment="GOMAXPROCS=2"
+
+[Install]
+WantedBy=multi-user.target

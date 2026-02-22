@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go mod:*)",
+      "Bash(go build:*)",
+      "Bash(go vet:*)",
+      "Bash(go generate:*)",
+      "Bash(make build:*)",
+      "Bash(make generate:*)",
+      "Bash(awk:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(ip link show)",
+      "Bash(ip:*)"
+    ]
+  }
+}

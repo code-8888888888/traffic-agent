@@ -1,0 +1,98 @@
+# traffic-agent configuration
+# Install to: /etc/traffic-agent/config.yaml
+#
+# All fields are optional — uncommented values show the defaults.
+
+# Network interface to attach TC eBPF programs to.
+interface: enp0s1
+
+# TCP ports to capture. Traffic on any other port is ignored at the BPF level.
+ports:
+  - 80    # HTTP
+  - 443   # HTTPS
+  - 8080  # HTTP alternate
+  - 8443  # HTTPS alternate
+
+# -----------------------------------------------------------------------
+# Traffic filtering (all rules are ANDed; empty = match everything)
+# -----------------------------------------------------------------------
+filter:
+  # Capture only from these source IPs (CIDR not yet supported, use exact IPs).
+  # src_ips:
+  #   - 10.0.0.1
+
+  # Capture only traffic destined for these IPs.
+  # dst_ips:
+  #   - 93.184.216.34
+
+  # Limit by source port.
+  # src_ports: []
+
+  # Limit by destination port (e.g. only HTTP, not HTTPS).
+  # dst_ports:
+  #   - 80
+
+  # Limit by process IDs.
+  # pids:
+  #   - 1234
+  #   - 5678
+
+  # Limit by process names (matched against /proc/<pid>/comm).
+  # processes:
+  #   - curl
+  #   - nginx
+
+# -----------------------------------------------------------------------
+# Output / logging
+# -----------------------------------------------------------------------
+output:
+  # Write JSON events to stdout.
+  stdout: true
+
+  # Write JSON events to a rotating log file.
+  # file: /var/log/traffic-agent/events.json
+
+  # Maximum file size before rotation (megabytes).
+  max_size_mb: 100
+
+  # Maximum age of retained log files (days).
+  max_age_days: 7
+
+  # Maximum number of old rotated files to keep.
+  max_backups: 3
+
+  # Gzip-compress rotated files.
+  compress: false
+
+# -----------------------------------------------------------------------
+# TLS / SSL plaintext interception via eBPF uprobes
+# -----------------------------------------------------------------------
+tls:
+  # Enable SSL_read / SSL_write uprobe interception.
+  enabled: false
+
+  # Attach only to these PIDs. Empty = attach to all processes using libssl.
+  # pids:
+  #   - 1234
+
+  # Attach only to processes with these comm names.
+  # processes:
+  #   - nginx
+  #   - python3
+
+  # Explicit path to libssl.so. Leave empty for auto-detection via
+  # /proc/<pid>/maps (recommended).
+  # libssl_path: /lib/x86_64-linux-gnu/libssl.so.3
+
+# -----------------------------------------------------------------------
+# HTTP event streaming endpoint
+# -----------------------------------------------------------------------
+event_stream:
+  # Expose a streaming HTTP endpoint for downstream consumers.
+  enabled: false
+
+  # TCP address to listen on.
+  address: "127.0.0.1:8080"
+
+  # HTTP path for the ndjson event stream.
+  path: /events
