@@ -112,7 +112,7 @@ func main() {
 
 	// ---- Start TLS interceptor (optional) ----
 	if cfg.TLS.Enabled {
-		sslEventCh := make(chan *types.SSLEvent, 256)
+		sslEventCh := make(chan *types.SSLEvent, 4096)
 
 		interceptor := tls.New(cfg.TLS)
 		if err := interceptor.Start(sslEventCh); err != nil {
@@ -126,6 +126,19 @@ func main() {
 				}
 			}()
 		}
+
+		// Periodic SSL event stats for diagnostics.
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				rx, h2p, h2r, h1, skip := parser.SSLEventStats()
+				if rx > 0 {
+					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d chan_len=%d",
+						rx, h2p, h2r, h1, skip, len(sslEventCh))
+				}
+			}
+		}()
 	}
 
 	// ---- Wait for shutdown signal ----

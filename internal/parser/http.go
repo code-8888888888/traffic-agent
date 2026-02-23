@@ -21,13 +21,25 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/traffic-agent/traffic-agent/internal/types"
+)
+
+// Debug counters for diagnostics.
+var (
+	sslEventsReceived  atomic.Int64
+	sslEventsH2Preface atomic.Int64
+	sslEventsH2Routed  atomic.Int64
+	sslEventsH1Path    atomic.Int64
+	sslEventsSkipped   atomic.Int64
 )
 
 const maxFlowBufSize = 256 * 1024 // 256 KB max accumulated per flow
@@ -117,12 +129,19 @@ func (p *Parser) HandlePacket(ev *types.RawPacketEvent) {
 	}
 }
 
+// SSLEventStats returns a snapshot of debug counters for diagnostics.
+func SSLEventStats() (received, h2preface, h2routed, h1path, skipped int64) {
+	return sslEventsReceived.Load(), sslEventsH2Preface.Load(),
+		sslEventsH2Routed.Load(), sslEventsH1Path.Load(), sslEventsSkipped.Load()
+}
+
 // HandleSSLEvent appends ev.Data to the per-SSL-stream buffer and attempts to
 // parse a complete HTTP/1.1 or HTTP/2 message from the accumulated plaintext.
 func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	if len(ev.Data) == 0 {
 		return
 	}
+	sslEventsReceived.Add(1)
 
 	h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID}
 
@@ -131,17 +150,23 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	h2State := p.h2Conns[h2Key]
 	p.mu.Unlock()
 
-	// Detect HTTP/2 connections:
-	// - from the client connection preface (new connection, agent started first), or
-	// - heuristically from frame structure (mid-connection, agent started after preface).
-	if h2State == nil && (isHTTP2Preface(ev.Data) || looksLikeHTTP2(ev.Data)) {
+	// Detect HTTP/2 connections ONLY from the explicit client connection preface
+	// ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").  The previous heuristic detector
+	// (looksLikeHTTP2) was removed because NSPR's PR_Write fires for ALL I/O
+	// — IPC, file writes, pipe data — not just TLS.  Arbitrary binary data
+	// frequently matches the heuristic (byte[0]<0x20 && byte[3]<=9), creating
+	// a false h2ConnState that swallows all subsequent traffic from the thread.
+	if h2State == nil && isHTTP2Preface(ev.Data) {
 		h2State = newH2ConnState()
 		p.mu.Lock()
 		p.h2Conns[h2Key] = h2State
 		p.mu.Unlock()
+		sslEventsH2Preface.Add(1)
+		log.Printf("[parser] HTTP/2 preface detected PID=%d TID=%d proc=%s", ev.PID, ev.TID, ev.ProcessName)
 	}
 
 	if h2State != nil {
+		sslEventsH2Routed.Add(1)
 		p.handleH2Event(h2State, ev)
 		return
 	}
@@ -323,11 +348,15 @@ type httpResponseFields struct {
 
 // parseHTTPRequestFields attempts to parse an HTTP/1.1 request from data.
 // Returns (nil, false) if the message is incomplete or not HTTP.
+//
+// Falls back to request-line-only parsing when the header block is truncated
+// (common with NSPR's PR_Write where data may exceed MAX_SSL_DATA_SIZE).
 func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	r := bufio.NewReader(bytes.NewReader(data))
 	req, err := http.ReadRequest(r)
 	if err != nil {
-		return nil, false
+		// Standard parser failed — try the request-line fallback.
+		return parseRequestLineFallback(data)
 	}
 	defer req.Body.Close()
 
@@ -364,14 +393,64 @@ func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	}, true
 }
 
+// parseRequestLineFallback extracts the HTTP method, URL, and any available
+// headers from truncated request data where http.ReadRequest fails because
+// the header block is not terminated with \r\n\r\n.
+func parseRequestLineFallback(data []byte) (*httpRequestFields, bool) {
+	idx := bytes.IndexByte(data, '\n')
+	if idx < 0 {
+		return nil, false
+	}
+	line := strings.TrimRight(string(data[:idx]), "\r")
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) != 3 || !strings.HasPrefix(parts[2], "HTTP/") {
+		return nil, false
+	}
+	method := parts[0]
+	if !isValidHTTPMethod(method) {
+		return nil, false
+	}
+	url := parts[1]
+
+	// Scan available header lines (may be incomplete).
+	headers := make(map[string]string)
+	scanner := bufio.NewScanner(bytes.NewReader(data[idx+1:]))
+	for scanner.Scan() {
+		hl := scanner.Text()
+		if hl == "" {
+			break // empty line = end of headers
+		}
+		if colonIdx := strings.IndexByte(hl, ':'); colonIdx > 0 {
+			key := strings.TrimSpace(hl[:colonIdx])
+			val := strings.TrimSpace(hl[colonIdx+1:])
+			headers[http.CanonicalHeaderKey(key)] = val
+		}
+	}
+
+	return &httpRequestFields{
+		method:  method,
+		url:     url,
+		headers: headers,
+	}, true
+}
+
+// isValidHTTPMethod returns true for standard HTTP methods.
+func isValidHTTPMethod(m string) bool {
+	switch m {
+	case "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "CONNECT", "TRACE":
+		return true
+	}
+	return false
+}
+
 // parseHTTPResponseFields attempts to parse an HTTP/1.1 response from data.
 // Returns (nil, false) if the message is incomplete or not HTTP.
 func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 	r := bufio.NewReader(bytes.NewReader(data))
 	resp, err := http.ReadResponse(r, nil)
 	if err != nil {
-		// Headers not yet fully buffered — keep accumulating.
-		return nil, false
+		// Standard parser failed — try status-line fallback for truncated data.
+		return parseResponseLineFallback(data)
 	}
 	defer resp.Body.Close()
 
@@ -422,6 +501,45 @@ func decompressGzip(data []byte) string {
 		return "<gzip-compressed>"
 	}
 	return string(out[:n])
+}
+
+// parseResponseLineFallback extracts the status code and available headers
+// from truncated response data.
+func parseResponseLineFallback(data []byte) (*httpResponseFields, bool) {
+	idx := bytes.IndexByte(data, '\n')
+	if idx < 0 {
+		return nil, false
+	}
+	line := strings.TrimRight(string(data[:idx]), "\r")
+	// Status line: "HTTP/1.1 200 OK"
+	parts := strings.SplitN(line, " ", 3)
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "HTTP/") {
+		return nil, false
+	}
+	code := 0
+	fmt.Sscanf(parts[1], "%d", &code)
+	if code < 100 || code > 599 {
+		return nil, false
+	}
+
+	headers := make(map[string]string)
+	scanner := bufio.NewScanner(bytes.NewReader(data[idx+1:]))
+	for scanner.Scan() {
+		hl := scanner.Text()
+		if hl == "" {
+			break
+		}
+		if colonIdx := strings.IndexByte(hl, ':'); colonIdx > 0 {
+			key := strings.TrimSpace(hl[:colonIdx])
+			val := strings.TrimSpace(hl[colonIdx+1:])
+			headers[http.CanonicalHeaderKey(key)] = val
+		}
+	}
+
+	return &httpResponseFields{
+		statusCode: code,
+		headers:    headers,
+	}, true
 }
 
 // ---- Helpers ----

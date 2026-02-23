@@ -78,6 +78,12 @@ type h2ConnState struct {
 	pendingReadBlock   []byte
 	pendingReadStream  uint32
 
+	// Corruption tracking.  NSPR's PR_Write fires for ALL I/O, not just TLS.
+	// Non-HTTP/2 data that sneaks through can corrupt frame parsing.  If too
+	// many consecutive frames fail validation, the connection state is deleted
+	// and a fresh one can be created from the next preface.
+	consecutiveErrors int
+
 	updated time.Time
 }
 
@@ -94,25 +100,17 @@ func isHTTP2Preface(data []byte) bool {
 	return bytes.HasPrefix(data, []byte(h2ClientPreface))
 }
 
-// looksLikeHTTP2 heuristically detects HTTP/2 frames when the agent started
-// mid-connection and missed the client connection preface.
-//
-// HTTP/1.1 text always starts with a printable ASCII byte (≥ 0x20): request
-// verbs ("GET", "POST", ...) or the response prefix ("HTTP").
-// HTTP/2 frame headers begin with a 3-byte length whose high byte is almost
-// always 0x00 (frame payloads are ≤ 16 KiB in practice), followed by a
-// 1-byte frame type (0x00–0x09).  The combination is unambiguous.
-func looksLikeHTTP2(data []byte) bool {
-	if len(data) < h2FrameHeaderLen {
-		return false
-	}
-	// Reject if the first byte is a printable ASCII character — that's HTTP/1.1.
-	if data[0] >= 0x20 {
-		return false
-	}
-	frameType := data[3]
-	return frameType <= h2FrameContinuation
-}
+// looksLikeHTTP2 was previously used for heuristic mid-connection detection
+// but was removed because NSPR's PR_Write fires for ALL I/O — IPC, files,
+// pipes — not just TLS.  Binary IPC data frequently false-positives
+// (byte[0]<0x20 && byte[3]<=9 matches ~0.5% of random data), creating a
+// corrupt h2ConnState that swallows all subsequent traffic on that thread.
+// Detection now relies solely on the unambiguous HTTP/2 client preface.
+
+// maxH2ConsecutiveErrors is the number of consecutive invalid frames before
+// the h2ConnState is considered corrupt and is deleted.  This handles the
+// case where non-TLS PR_Write data leaks into the HTTP/2 buffer.
+const maxH2ConsecutiveErrors = 5
 
 // handleH2Event appends ev.Data to the connection's direction buffer and
 // parses as many complete HTTP/2 frames as possible, calling p.sink for
@@ -129,6 +127,19 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 		if isHTTP2Preface(data) {
 			data = data[len(h2ClientPreface):]
 		}
+		if len(data) == 0 {
+			p.mu.Unlock()
+			return
+		}
+
+		// When the write buffer is empty we are NOT in the middle of a
+		// partial frame.  Validate that new data looks like HTTP/2 frames
+		// to filter out non-TLS PR_Write noise (IPC, files, etc.).
+		if len(state.writeBuf) == 0 && !isValidH2FrameStart(data) {
+			p.mu.Unlock()
+			return
+		}
+
 		if len(state.writeBuf)+len(data) <= maxFlowBufSize {
 			state.writeBuf = append(state.writeBuf, data...)
 		}
@@ -139,6 +150,11 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 		}
 	} else {
 		// Incoming (SSL_read): server → browser.
+		if len(state.readBuf) == 0 && !isValidH2FrameStart(ev.Data) {
+			p.mu.Unlock()
+			return
+		}
+
 		if len(state.readBuf)+len(ev.Data) <= maxFlowBufSize {
 			state.readBuf = append(state.readBuf, ev.Data...)
 		}
@@ -148,11 +164,39 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 			state.readBuf = state.readBuf[n:]
 		}
 	}
+
+	// If too many consecutive errors, the state is corrupt.
+	// Delete it so a fresh preface can re-create a clean state.
+	if state.consecutiveErrors >= maxH2ConsecutiveErrors {
+		h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID}
+		delete(p.h2Conns, h2Key)
+	}
+
 	p.mu.Unlock()
 
 	for _, te := range pending {
 		p.sink(te)
 	}
+}
+
+// isValidH2FrameStart checks whether data begins with a plausible HTTP/2
+// frame header.  Used to filter out non-HTTP/2 data (IPC, file I/O, etc.)
+// that reaches the parser via NSPR's PR_Write.
+func isValidH2FrameStart(data []byte) bool {
+	if len(data) < h2FrameHeaderLen {
+		return false
+	}
+	frameType := data[3]
+	if frameType > 0x09 { // HTTP/2 defines frame types 0x0 – 0x9
+		return false
+	}
+	frameLen := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
+	// SETTINGS_MAX_FRAME_SIZE default is 16384; maximum allowed is 16777215.
+	// Use 1 MiB as a generous sanity check.
+	if frameLen > 1<<20 {
+		return false
+	}
+	return true
 }
 
 // parseH2Frames consumes as many complete HTTP/2 frames as possible from data
@@ -166,6 +210,14 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm s
 		flags := data[4]
 		streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 
+		// Validate frame type and length.  If invalid, the buffer is
+		// corrupt (non-HTTP/2 data leaked in).  Discard everything
+		// remaining so the next event starts with a clean buffer.
+		if frameType > 0x09 || frameLen > 1<<20 {
+			s.consecutiveErrors++
+			return consumed + len(data)
+		}
+
 		total := h2FrameHeaderLen + frameLen
 		if len(data) < total {
 			break // incomplete frame — wait for more data
@@ -178,6 +230,9 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm s
 		case h2FrameContinuation:
 			s.processContinuationFrame(payload, flags, streamID, isRead, pid, comm, emit)
 		}
+
+		// Valid frame consumed — reset error counter.
+		s.consecutiveErrors = 0
 
 		consumed += total
 		data = data[total:]
@@ -262,8 +317,9 @@ func (s *h2ConnState) emitFromBlock(block []byte, _ uint32, isRead bool, pid uin
 	dec.SetEmitEnabled(false)
 
 	if err != nil {
-		// Dynamic table out of sync (agent missed earlier frames).
-		// Reset so future connections can decode correctly.
+		// Dynamic table out of sync (agent missed earlier frames or
+		// garbage data leaked in).  Reset so future frames decode correctly.
+		s.consecutiveErrors++
 		if isRead {
 			s.readDecoder = hpack.NewDecoder(4096, nil)
 		} else {

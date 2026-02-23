@@ -11,7 +11,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -23,7 +22,7 @@ import (
 )
 
 // maxSSLDataSize must match MAX_SSL_DATA_SIZE in bpf/headers/common.h.
-const maxSSLDataSize = 512
+const maxSSLDataSize = 4096
 
 // rawSSLEvent mirrors struct ssl_event from bpf/ssl_uprobe.c.
 type rawSSLEvent struct {
@@ -465,8 +464,9 @@ func (i *Interceptor) readLoop(ch chan<- *types.SSLEvent) {
 }
 
 func parseSSLEvent(data []byte) (*types.SSLEvent, error) {
-	minSize := int(unsafe.Sizeof(rawSSLEvent{}))
-	if len(data) < minSize {
+	// The fixed header is 44 bytes (before the variable-length data field).
+	const headerSize = 44
+	if len(data) < headerSize {
 		return nil, fmt.Errorf("short SSL record: %d bytes", len(data))
 	}
 
