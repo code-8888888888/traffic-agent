@@ -193,10 +193,11 @@ All four libraries share the same calling convention — `(context, buf, len)` w
 
 When `tls.enabled: true` with no `pids` or `processes` specified, the agent scans **all running processes** via `/proc/*/maps` at startup. For every unique SSL shared library found, it attaches system-wide uprobes (PID 0) so that even processes that start *after* the agent are covered for libraries already attached.
 
-```bash
-# Example startup log showing auto-detection
-[tls] attached global SSL uprobes to /usr/lib/aarch64-linux-gnu/libssl.so.3
-[tls] attached global SSL uprobes to /usr/lib/x86_64-linux-gnu/libgnutls.so.30
+```
+[tls] attached global uprobes to libnspr4.so (PR_Write/PR_Read)
+[tls] attached global uprobes to libssl.so.3 (SSL_write/SSL_read)
+[tls] attached global uprobes to libgnutls.so.30.31.0 (gnutls_record_send/gnutls_record_recv)
+[tls] attached BoringSSL uprobes to node (pid=0, dynamic=false, write_off=0x15fa654)
 ```
 
 ### Enabling TLS interception
@@ -215,17 +216,38 @@ tls:
 # Start the agent
 sudo ./bin/traffic-agent --config config/config.yaml
 
-# In another terminal — use --http1.1 to avoid HTTP/2 binary framing
+# In another terminal — use --http1.1 to avoid HTTP/2 binary framing (curl / OpenSSL)
 curl --http1.1 https://httpbin.org/get
 curl --http1.1 https://httpbin.org/post -H 'Content-Type: application/json' -d '{"hello":"world"}'
+
+# wget uses GnuTLS — exercises a different SSL library path
+wget -q -O /dev/null https://httpbin.org/get
+
+# node.js uses BoringSSL (statically linked)
+node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
 ```
 
 ### Example output
 
+**curl (OpenSSL / `libssl.so`)**
 ```json
 {"timestamp":"2026-02-22T14:58:39.270923093Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":349147,"process_name":"curl","http_method":"POST","url":"/post","request_headers":{"Accept":"*/*","Content-Length":"17","Content-Type":"application/json","Host":"httpbin.org","User-Agent":"curl/7.81.0"},"body_snippet":"{\"hello\":\"world\"}","tls_intercepted":true}
 {"timestamp":"2026-02-22T14:58:39.798016124Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":349147,"process_name":"curl","status_code":200,"response_headers":{"Content-Length":"434","Content-Type":"application/json","Server":"gunicorn/19.9.0"},"body_snippet":"{\n  \"data\": \"{\\\"hello\\\":\\\"world\\\"}\", ...}","tls_intercepted":true}
 ```
+
+**wget (GnuTLS / `libgnutls.so`)**
+```json
+{"timestamp":"2026-02-23T08:12:22.443905725Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":495490,"process_name":"wget","http_method":"GET","url":"/get","request_headers":{"Accept":"*/*","Host":"httpbin.org","User-Agent":"Wget/1.21.2"},"tls_intercepted":true}
+{"timestamp":"2026-02-23T08:12:22.921146727Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":495490,"process_name":"wget","status_code":200,"response_headers":{"Content-Length":"293","Content-Type":"application/json"},"body_snippet":"{\n  \"url\": \"https://httpbin.org/get\"\n}\n","tls_intercepted":true}
+```
+
+**Firefox (NSS/NSPR / `libnspr4.so`) — captive portal check captured automatically on startup**
+```json
+{"timestamp":"2026-02-23T08:24:21.938143297Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":32866,"dst_port":80,"protocol":"TCP","direction":"egress","pid":504879,"process_name":"firefox","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"},"tls_intercepted":false}
+{"timestamp":"2026-02-23T08:25:42.484974858Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":507713,"process_name":"Socket Thread","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"},"tls_intercepted":true}
+```
+
+> **Note on Firefox process names:** Firefox's network I/O runs on a dedicated thread whose Linux comm is `"Socket Thread"`. This appears as `process_name` on TLS events. Plain HTTP events from the same Firefox instance show `"firefox"` as the process_name (resolved from `/proc/net/tcp`).
 
 > **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
 
