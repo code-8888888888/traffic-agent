@@ -274,37 +274,39 @@ Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent s
 
 > **Note on Firefox process names:** Firefox uses a multi-process architecture. The main process comm is `"firefox"` (shown on TCP events resolved via `/proc/net/tcp`). The dedicated network I/O thread comm is `"Socket Thread"` (shown on TLS/NSPR events).
 
-> **Note on Firefox HTTPS:** Most Firefox HTTPS requests use HTTP/2 (negotiated via TLS ALPN), which produces no events — binary frames are silently dropped. HTTP/1.1 over TLS **is** captured: WebSocket upgrades (shown above), connections to HTTP/1.1-only servers, and any other flow Firefox negotiates without HTTP/2. Plain HTTP (port 80) is always captured by the TC hook regardless.
+> **Note on Firefox HTTPS:** HTTP/2 request headers are captured via NSPR uprobes (see HTTP/2 section below). Response headers are not captured for Firefox because `PR_Read` is an indirect tail-call on ARM64 — the response data is not available at the uprobe entry point. For full request+response capture use curl, wget, or node. Plain HTTP (port 80) is always captured by the TC hook regardless.
 
 > **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
 
-### HTTP/2 limitation
+### HTTP/2
 
-Modern HTTPS connections typically negotiate **HTTP/2** via TLS ALPN. HTTP/2 uses binary HPACK framing which is not parseable by the HTTP/1.1 parser. This affects both capture paths:
+The agent fully parses **HTTP/2** traffic on all SSL library paths. HPACK header decoding is built in; no configuration is required.
 
 | Capture path | HTTP/1.1 over TLS | HTTP/2 over TLS |
 |---|---|---|
-| TC hook (port 80 cleartext) | ✅ captured | ✅ h2c preface silently dropped |
-| SSL uprobe (OpenSSL / NSPR / …) | ✅ captured | ✅ PRI preface silently dropped; subsequent binary frames produce no events |
+| TC hook (port 80 cleartext) | ✅ request + response | ✅ h2c preface silently dropped |
+| SSL uprobe — OpenSSL (`libssl.so`) | ✅ request + response | ✅ request + response |
+| SSL uprobe — GnuTLS (`libgnutls.so`) | ✅ request + response | ✅ request + response |
+| SSL uprobe — BoringSSL (static) | ✅ request + response | ✅ request + response |
+| SSL uprobe — NSPR (`libnspr4.so`, Firefox) | ✅ request + response | ✅ **request only** (see note) |
 
-**curl** defaults to HTTP/2 when the server supports it. Force HTTP/1.1 to capture both request and response:
+**curl** defaults to HTTP/2 when the server supports it — both request and response are captured:
 
 ```bash
+# HTTP/2 (default when server supports it)
+curl -s https://example.com/api
+
+# Force HTTP/1.1 if needed
 curl --http1.1 https://example.com/api
 ```
 
-**Firefox** negotiates HTTP/2 for virtually all regular HTTPS browsing. The SSL/NSPR uprobe fires correctly, but the captured payload is HTTP/2 binary framing. Traffic that Firefox sends as HTTP/1.1 over TLS **is** captured — for example, WebSocket upgrade handshakes (`Upgrade: websocket`) and connections to HTTP/1.1-only servers:
+**Firefox** HTTP/2 requests are captured via the NSPR uprobe. Response headers are not captured for Firefox because `PR_Read`/`PR_Recv` are ARM64 indirect tail-calls (no `uretprobe` can fire) and NSS's `libssl3.so` exports no hookable read symbols. Additionally, Firefox uses HTTP/3 (QUIC over UDP) for many popular sites; QUIC traffic is not visible to the TC hook (TCP only) or NSPR uprobes.
 
-```json
-{"protocol":"TLS","tls_intercepted":true,"process_name":"Socket Thread",
- "http_method":"GET","url":"/",
- "request_headers":{"Host":"push.services.mozilla.com","Upgrade":"websocket",
-                     "Sec-Websocket-Protocol":"push-notification",...}}
-```
+**Existing connections** (opened before the agent started) are detected heuristically from the HTTP/2 frame structure and parsed correctly, though the HPACK dynamic table starts empty — headers referencing dynamic table entries built up before the agent started may decode incorrectly. New connections opened after the agent starts decode fully.
 
-Plain HTTP from Firefox (port 80, no TLS) is always captured by the TC hook regardless of version.
+Plain HTTP from Firefox (port 80, no TLS) is always captured by the TC hook.
 
-HTTP/2 frame parsing (HPACK headers + DATA frames) is tracked in [Known Limitations](#known-limitations).
+See [Known Limitations](#known-limitations) for HTTP/3 and Firefox response capture.
 
 ### Target-specific attachment
 

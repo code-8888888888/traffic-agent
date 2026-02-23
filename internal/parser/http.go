@@ -61,6 +61,7 @@ type Parser struct {
 	mu      sync.Mutex
 	bufs    map[flowKey]*flowBuf
 	sslBufs map[sslFlowKey]*flowBuf
+	h2Conns map[h2ConnKey]*h2ConnState // HTTP/2 connection states keyed by (PID, TID)
 }
 
 // New creates a Parser that will call sink for each parsed HTTP event.
@@ -69,6 +70,7 @@ func New(sink EventSink) *Parser {
 		sink:    sink,
 		bufs:    make(map[flowKey]*flowBuf),
 		sslBufs: make(map[sslFlowKey]*flowBuf),
+		h2Conns: make(map[h2ConnKey]*h2ConnState),
 	}
 }
 
@@ -116,12 +118,35 @@ func (p *Parser) HandlePacket(ev *types.RawPacketEvent) {
 }
 
 // HandleSSLEvent appends ev.Data to the per-SSL-stream buffer and attempts to
-// parse a complete HTTP request or response from the accumulated plaintext.
+// parse a complete HTTP/1.1 or HTTP/2 message from the accumulated plaintext.
 func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	if len(ev.Data) == 0 {
 		return
 	}
 
+	h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID}
+
+	// Check whether this (PID, TID) is already tracked as an HTTP/2 connection.
+	p.mu.Lock()
+	h2State := p.h2Conns[h2Key]
+	p.mu.Unlock()
+
+	// Detect HTTP/2 connections:
+	// - from the client connection preface (new connection, agent started first), or
+	// - heuristically from frame structure (mid-connection, agent started after preface).
+	if h2State == nil && (isHTTP2Preface(ev.Data) || looksLikeHTTP2(ev.Data)) {
+		h2State = newH2ConnState()
+		p.mu.Lock()
+		p.h2Conns[h2Key] = h2State
+		p.mu.Unlock()
+	}
+
+	if h2State != nil {
+		p.handleH2Event(h2State, ev)
+		return
+	}
+
+	// ---- HTTP/1.1 path ----
 	key := sslFlowKey{PID: ev.PID, TID: ev.TID, IsRead: ev.IsRead}
 
 	p.mu.Lock()
@@ -139,11 +164,6 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	p.mu.Unlock()
 
 	if !ev.IsRead {
-		// HTTP/2 cleartext connection preface — discard, we can't parse HTTP/2 framing.
-		if bytes.HasPrefix(data, []byte("PRI * HTTP/2.0")) {
-			p.deleteSSLBuf(key)
-			return
-		}
 		// SSL_write: process is sending plaintext → HTTP request (egress).
 		fields, ok := parseHTTPRequestFields(data)
 		if !ok {
@@ -199,6 +219,11 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 	for key, fb := range p.sslBufs {
 		if fb.updated.Before(cutoff) {
 			delete(p.sslBufs, key)
+		}
+	}
+	for key, state := range p.h2Conns {
+		if state.updated.Before(cutoff) {
+			delete(p.h2Conns, key)
 		}
 	}
 }

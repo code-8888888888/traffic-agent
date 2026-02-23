@@ -1,6 +1,6 @@
 module github.com/traffic-agent/traffic-agent
 
-go 1.22
+go 1.24.0
 
 require (
 	github.com/cilium/ebpf v0.16.0
@@ -10,7 +10,8 @@ require (
 
 require (
 	github.com/vishvananda/netlink v1.1.0
-	golang.org/x/sys v0.27.0
+	golang.org/x/net v0.50.0
+	golang.org/x/sys v0.41.0
 )
 
 require (
