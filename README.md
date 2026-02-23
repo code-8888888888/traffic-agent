@@ -225,6 +225,26 @@ wget -q -O /dev/null https://httpbin.org/get
 
 # node.js uses BoringSSL (statically linked)
 node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
+
+# Firefox — start it before the agent so libnspr4.so appears in /proc/*/maps at scan time,
+# then restart the agent; any subsequent Firefox HTTPS traffic will be intercepted
+```
+
+### Firefox — startup order
+
+Firefox loads `libnspr4.so` only after it establishes its first TLS connection (lazy via `libxul.so`). The agent discovers SSL libraries by scanning `/proc/*/maps` at startup, so:
+
+1. Start Firefox first and let it fully initialize (captive portal check establishes a TLS connection)
+2. Start the agent — it will find and attach to `libnspr4.so` across all Firefox processes
+3. All subsequent Firefox HTTPS traffic is intercepted automatically
+
+```bash
+# Start Firefox (background, let it initialize)
+/snap/firefox/current/usr/lib/firefox/firefox --headless --no-remote https://example.com &
+sleep 15   # wait for libnspr4.so to be loaded
+
+# Now start the agent
+sudo ./bin/traffic-agent --config config/config.yaml
 ```
 
 ### Example output
@@ -241,13 +261,22 @@ node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
 {"timestamp":"2026-02-23T08:12:22.921146727Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":495490,"process_name":"wget","status_code":200,"response_headers":{"Content-Length":"293","Content-Type":"application/json"},"body_snippet":"{\n  \"url\": \"https://httpbin.org/get\"\n}\n","tls_intercepted":true}
 ```
 
-**Firefox (NSS/NSPR / `libnspr4.so`) — captive portal check captured automatically on startup**
+**node.js (BoringSSL, statically linked)**
 ```json
-{"timestamp":"2026-02-23T08:24:21.938143297Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":32866,"dst_port":80,"protocol":"TCP","direction":"egress","pid":504879,"process_name":"firefox","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"},"tls_intercepted":false}
-{"timestamp":"2026-02-23T08:25:42.484974858Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":507713,"process_name":"Socket Thread","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"},"tls_intercepted":true}
+{"timestamp":"2026-02-23T08:12:23.791410357Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":495514,"process_name":"MainThread","http_method":"GET","url":"/get","request_headers":{"Connection":"keep-alive","Host":"httpbin.org"},"tls_intercepted":true}
+{"timestamp":"2026-02-23T08:12:24.026492630Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":495514,"process_name":"MainThread","status_code":200,"response_headers":{"Content-Length":"201","Content-Type":"application/json"},"body_snippet":"{\n  \"url\": \"https://httpbin.org/get\"\n}\n","tls_intercepted":true}
 ```
 
-> **Note on Firefox process names:** Firefox's network I/O runs on a dedicated thread whose Linux comm is `"Socket Thread"`. This appears as `process_name` on TLS events. Plain HTTP events from the same Firefox instance show `"firefox"` as the process_name (resolved from `/proc/net/tcp`).
+**Firefox 146 (NSS/NSPR / `libnspr4.so`) — captive portal and connectivity checks captured on startup**
+```json
+{"timestamp":"2026-02-23T08:38:43.874223516Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":526318,"process_name":"Socket Thread","http_method":"IPRI","url":"*","tls_intercepted":true}
+{"timestamp":"2026-02-23T08:38:44.601475858Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":36994,"dst_port":80,"protocol":"TCP","direction":"egress","pid":526318,"process_name":"firefox","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"}}
+{"timestamp":"2026-02-23T08:38:44.628603675Z","src_ip":"34.107.221.82","dst_ip":"192.168.68.61","src_port":80,"dst_port":36994,"protocol":"TCP","direction":"ingress","pid":526318,"process_name":"firefox","status_code":200,"response_headers":{"Content-Length":"90","Content-Type":"text/html"},"body_snippet":"\u003cmeta http-equiv=\"refresh\" content=\"0;url=https://support.mozilla.org/kb/captive-portal\"/\u003e"}
+{"timestamp":"2026-02-23T08:38:47.910005520Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":51470,"dst_port":80,"protocol":"TCP","direction":"egress","pid":523945,"process_name":"firefox","http_method":"GET","url":"/success.txt?ipv4","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"}}
+{"timestamp":"2026-02-23T08:38:47.917333680Z","src_ip":"34.107.221.82","dst_ip":"192.168.68.61","src_port":80,"dst_port":51470,"protocol":"TCP","direction":"ingress","pid":523945,"process_name":"firefox","status_code":200,"response_headers":{"Content-Length":"8","Content-Type":"text/plain"},"body_snippet":"success\n"}
+```
+
+> **Note on Firefox process names:** Firefox uses a multi-process architecture. The main process comm is `"firefox"` (shown on TCP events resolved via `/proc/net/tcp`). The dedicated network I/O process comm is `"Socket Thread"` (shown on TLS/NSS events). The `IPRI` method on the first TLS event is Firefox's HTTP/2 upgrade preface (`PRI * HTTP/2.0`) — see the HTTP/2 caveat below.
 
 > **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
 
