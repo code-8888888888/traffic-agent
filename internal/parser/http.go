@@ -20,6 +20,7 @@ package parser
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"strings"
@@ -361,7 +362,12 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 
 	body := ""
 	if bodyN > 0 {
-		body = string(bodyBuf[:bodyN])
+		rawBody := bodyBuf[:bodyN]
+		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+			body = decompressGzip(rawBody)
+		} else {
+			body = string(rawBody)
+		}
 	}
 
 	return &httpResponseFields{
@@ -369,6 +375,23 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 		headers:    headersToMap(resp.Header),
 		body:       body,
 	}, true
+}
+
+// decompressGzip attempts to decompress gzip-encoded data and returns up to
+// BodySnippetMaxLen bytes of the decompressed content as a string.
+// Returns "<gzip-compressed>" if the data cannot be decompressed.
+func decompressGzip(data []byte) string {
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return "<gzip-compressed>"
+	}
+	defer gr.Close()
+	out := make([]byte, types.BodySnippetMaxLen)
+	n, err := io.ReadAtLeast(gr, out, 1)
+	if err != nil && n == 0 {
+		return "<gzip-compressed>"
+	}
+	return string(out[:n])
 }
 
 // ---- Helpers ----
