@@ -84,6 +84,34 @@ tls:
   # /proc/<pid>/maps (recommended).
   # libssl_path: /lib/x86_64-linux-gnu/libssl.so.3
 
+  # BoringSSL support: for apps that bundle BoringSSL instead of linking
+  # against the system libssl.so (e.g. Chromium, Electron, some Node.js builds).
+  #
+  # Three attachment modes are tried in order:
+  #   1. Shared library (.so in path) — symbol lookup on the .so.
+  #   2. Executable with symbols — ELF symbol table present; attach by name.
+  #   3. Stripped executable — requires explicit ssl_write_offset / ssl_read_offset.
+  #
+  # Finding file offsets for a stripped binary:
+  #   readelf -s <binary> | grep SSL_write   # if partially stripped
+  #   nm <binary>         | grep SSL_write   # if full symbol table present
+  #   # For fully stripped: use a debug build of the same version.
+  #
+  # boringssl_executables:
+  #
+  #   # Chromium snap (ARM64, stripped — replace offsets with your version's values):
+  #   - path: /snap/chromium/current/usr/lib/chromium-browser/chrome
+  #     process_name: chrome
+  #     ssl_write_offset: 0x0  # file offset of SSL_write
+  #     ssl_read_offset:  0x0  # file offset of SSL_read
+  #
+  #   # App with dynamic libboringssl.so (symbol lookup, no offsets needed):
+  #   - path: /opt/myapp/lib/libboringssl.so
+  #
+  #   # Unstripped / debug build (symbol lookup works without offsets):
+  #   - path: /usr/local/bin/myapp
+  #     process_name: myapp
+
 # -----------------------------------------------------------------------
 # HTTP event streaming endpoint
 # -----------------------------------------------------------------------

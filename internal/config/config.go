@@ -56,6 +56,35 @@ type OutputConfig struct {
 	Compress bool `yaml:"compress"`
 }
 
+// BoringSSlExecutable describes a single executable or shared library that
+// contains a statically or dynamically linked BoringSSL and should have
+// SSL_write/SSL_read uprobes attached to it.
+//
+// Use this for applications (e.g. Chromium) that bundle BoringSSL internally
+// rather than linking against the system libssl.so.
+type BoringSSlExecutable struct {
+	// Path is the absolute path to the executable or shared library.
+	// For snap packages you may use the "current" symlink
+	// (e.g. /snap/chromium/current/usr/lib/chromium-browser/chrome);
+	// the agent resolves symlinks automatically.
+	Path string `yaml:"path"`
+
+	// ProcessName, if non-empty, restricts uprobe attachment to processes
+	// whose comm name (/proc/<pid>/comm) matches this value.
+	// Leave empty to attach system-wide (catches all instances of the binary).
+	ProcessName string `yaml:"process_name"`
+
+	// SSLWriteOffset is the file offset (bytes from start of file) of the
+	// SSL_write function inside the binary. Required for stripped executables
+	// where symbol lookup fails. Set to 0 to attempt auto-detection via the
+	// ELF symbol table (works for unstripped or partially-stripped binaries).
+	SSLWriteOffset uint64 `yaml:"ssl_write_offset"`
+
+	// SSLReadOffset is the file offset of the SSL_read function.
+	// Must be provided together with SSLWriteOffset for stripped binaries.
+	SSLReadOffset uint64 `yaml:"ssl_read_offset"`
+}
+
 // TLSConfig configures eBPF uprobe-based TLS/SSL interception.
 type TLSConfig struct {
 	// Enabled activates SSL uprobe interception.
@@ -68,6 +97,10 @@ type TLSConfig struct {
 	// LibSSLPath is the path to libssl.so for symbol resolution.
 	// Leave empty to auto-detect from /proc/<pid>/maps.
 	LibSSLPath string `yaml:"libssl_path"`
+	// BoringSSlExecutables lists executables or libraries with statically embedded
+	// or dynamically loaded BoringSSL (e.g. Chromium, Electron, some Node.js builds).
+	// These are handled independently of the system libssl.so uprobe path.
+	BoringSSlExecutables []BoringSSlExecutable `yaml:"boringssl_executables"`
 }
 
 // StreamConfig configures the HTTP event streaming endpoint.

@@ -93,6 +93,13 @@ func (i *Interceptor) Start(events chan<- *types.SSLEvent) error {
 		}
 	}
 
+	// Attach BoringSSL uprobes for explicitly configured executables.
+	for _, entry := range i.cfg.BoringSSlExecutables {
+		if err := i.attachBoringSSlEntry(entry); err != nil {
+			log.Printf("[tls] boringssl %q: %v", entry.Path, err)
+		}
+	}
+
 	var err error
 	i.reader, err = ringbuf.NewReader(i.objs.SSLUprobeMaps.SslEvents)
 	if err != nil {
@@ -220,7 +227,161 @@ func (i *Interceptor) attachGlobal() error {
 	}
 
 	log.Printf("[tls] attached global SSL uprobes to %s", libPath)
+
+	// Also scan running processes for dynamically loaded BoringSSL libraries
+	// (e.g. apps that ship their own libboringssl.so).
+	i.scanForDynamicBoringSSL()
 	return nil
+}
+
+// ---- BoringSSL attachment methods ----
+
+// attachBoringSSlEntry processes one BoringSSlExecutable config entry.
+// It resolves the target binary, resolves SSL offsets (or uses config-provided
+// ones), and attaches uprobes — scoped per-PID if process_name is set,
+// or system-wide otherwise.
+func (i *Interceptor) attachBoringSSlEntry(entry config.BoringSSlExecutable) error {
+	dynamic := isDynamicLib(entry.Path)
+
+	if entry.ProcessName != "" {
+		// Find all running PIDs matching the process name.
+		pids, err := findPIDsByName([]string{entry.ProcessName})
+		if err != nil {
+			return fmt.Errorf("find pids: %w", err)
+		}
+		if len(pids) == 0 {
+			log.Printf("[tls] boringssl: no running processes named %q (will miss if started later)", entry.ProcessName)
+			return nil
+		}
+		seen := make(map[string]bool)
+		for _, pid := range pids {
+			exePath := resolveExecPath(entry.Path, pid)
+			writeOff, readOff := entry.SSLWriteOffset, entry.SSLReadOffset
+			if !dynamic && writeOff == 0 {
+				writeOff, readOff, _ = findSSLSymbolOffsets(exePath)
+			}
+			t := &boringSSlTarget{
+				execPath:       exePath,
+				sslWriteOffset: writeOff,
+				sslReadOffset:  readOff,
+				isDynamic:      dynamic,
+				pid:            pid,
+			}
+			// For static binaries, avoid attaching the same on-disk file twice
+			// (multiple processes share the same inode; one system-wide attach suffices).
+			if !dynamic {
+				if seen[exePath] {
+					continue
+				}
+				t.pid = 0 // attach system-wide for static binary
+				seen[exePath] = true
+			}
+			if err := i.attachBoringSSlProbes(t); err != nil {
+				log.Printf("[tls] boringssl attach %s (pid=%d): %v", exePath, t.pid, err)
+			}
+		}
+		return nil
+	}
+
+	// No process_name: attach system-wide.
+	realPath := resolveExecPath(entry.Path, 0)
+	writeOff, readOff := entry.SSLWriteOffset, entry.SSLReadOffset
+	if !dynamic && writeOff == 0 {
+		writeOff, readOff, _ = findSSLSymbolOffsets(realPath)
+	}
+	t := &boringSSlTarget{
+		execPath:       realPath,
+		sslWriteOffset: writeOff,
+		sslReadOffset:  readOff,
+		isDynamic:      dynamic,
+		pid:            0,
+	}
+	return i.attachBoringSSlProbes(t)
+}
+
+// attachBoringSSlProbes attaches the four SSL uprobe/uretprobe programs to t.
+// For dynamic libraries or binaries with symbol tables (t.sslWriteOffset == 0),
+// it uses symbol-name lookup. For stripped static binaries it uses the file
+// offsets in t.sslWriteOffset / t.sslReadOffset via UprobeOptions.Address,
+// which bypasses cilium/ebpf's internal symbol resolution entirely.
+func (i *Interceptor) attachBoringSSlProbes(t *boringSSlTarget) error {
+	if !t.isDynamic && t.sslWriteOffset == 0 {
+		return fmt.Errorf(
+			"no SSL symbols found and no offsets configured for %s — "+
+				"set ssl_write_offset and ssl_read_offset in boringssl_executables config",
+			t.execPath,
+		)
+	}
+
+	ex, err := link.OpenExecutable(t.execPath)
+	if err != nil {
+		return fmt.Errorf("open executable %s: %w", t.execPath, err)
+	}
+
+	type probeSpec struct {
+		sym    string
+		prog   *ebpf.Program
+		ret    bool
+		offset uint64
+	}
+	probes := []probeSpec{
+		{"SSL_write", i.objs.UprobeSslWriteEntry, false, t.sslWriteOffset},
+		{"SSL_write", i.objs.UretprobeSslWriteRet, true, t.sslWriteOffset},
+		{"SSL_read", i.objs.UprobeSslReadEntry, false, t.sslReadOffset},
+		{"SSL_read", i.objs.UretprobeSslReadRet, true, t.sslReadOffset},
+	}
+
+	for _, p := range probes {
+		opts := &link.UprobeOptions{PID: t.pid}
+		if !t.isDynamic && p.offset > 0 {
+			// Offset-based attachment: bypasses symbol lookup for stripped binaries.
+			opts.Address = p.offset
+		}
+		var l link.Link
+		if p.ret {
+			l, err = ex.Uretprobe(p.sym, p.prog, opts)
+		} else {
+			l, err = ex.Uprobe(p.sym, p.prog, opts)
+		}
+		if err != nil {
+			return fmt.Errorf("attach uprobe %s (ret=%v, addr=0x%x): %w", p.sym, p.ret, p.offset, err)
+		}
+		i.links = append(i.links, l)
+	}
+
+	log.Printf("[tls] attached BoringSSL uprobes to %s (pid=%d, dynamic=%v, write_off=0x%x)",
+		filepath.Base(t.execPath), t.pid, t.isDynamic, t.sslWriteOffset)
+	return nil
+}
+
+// scanForDynamicBoringSSL iterates /proc/*/maps looking for processes that
+// have loaded a BoringSSL shared library and attaches uprobes to each unique
+// library path found. Called automatically in global (no-PID) attach mode.
+func (i *Interceptor) scanForDynamicBoringSSL() {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return
+	}
+	seen := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		libPath := findDynamicBoringSSlLib(pid)
+		if libPath == "" || seen[libPath] {
+			continue
+		}
+		seen[libPath] = true
+		// isDynamic=true: symbol lookup is used, no offsets needed.
+		t := &boringSSlTarget{execPath: libPath, isDynamic: true, pid: 0}
+		if err := i.attachBoringSSlProbes(t); err != nil {
+			log.Printf("[tls] dynamic BoringSSL %s: %v", libPath, err)
+		}
+	}
 }
 
 // readLoop reads SSL events from the ring buffer and forwards them.
