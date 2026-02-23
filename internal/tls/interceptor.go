@@ -177,11 +177,12 @@ func (i *Interceptor) attachGlobal() error {
 			if attached[lib.path] {
 				continue
 			}
+			// Mark as seen before attempting so errors are logged only once,
+			// even if the same path appears in many processes' maps.
+			attached[lib.path] = true
 			if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0); err != nil {
 				log.Printf("[tls] %s: %v", filepath.Base(lib.path), err)
-				continue
 			}
-			attached[lib.path] = true
 		}
 
 		// Check the process executable for statically-linked BoringSSL with symbols.
