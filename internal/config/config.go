@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -146,12 +147,15 @@ func LoadOrDefault(path string) *Config {
 func defaultConfig() *Config {
 	cfg := &Config{}
 	cfg.applyDefaults()
+	// Enable TLS interception by default so the agent works out-of-the-box
+	// without a config file.  A config file can override with enabled: false.
+	cfg.TLS.Enabled = true
 	return cfg
 }
 
 func (c *Config) applyDefaults() {
 	if c.Interface == "" {
-		c.Interface = "eth0"
+		c.Interface = defaultInterface()
 	}
 	if len(c.Ports) == 0 {
 		c.Ports = []int{80, 443, 8080, 8443}
@@ -174,9 +178,48 @@ func (c *Config) applyDefaults() {
 	if c.EventStream.Path == "" {
 		c.EventStream.Path = "/events"
 	}
-	if c.TLS.LibSSLPath == "" {
-		c.TLS.LibSSLPath = "" // auto-detect
+}
+
+// defaultInterface returns the name of the network interface that carries the
+// default route (i.e. the outbound internet interface).  Falls back to "eth0"
+// if detection fails so the agent starts rather than panicking.
+func defaultInterface() string {
+	// Probe by dialling a well-known external address without actually sending
+	// any traffic; the OS selects the outbound interface, and we read its name.
+	conn, err := net.Dial("udp", "8.8.8.8:53")
+	if err != nil {
+		return "eth0"
 	}
+	defer conn.Close()
+
+	localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || localAddr == nil {
+		return "eth0"
+	}
+
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return "eth0"
+	}
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.Equal(localAddr.IP) {
+				return iface.Name
+			}
+		}
+	}
+	return "eth0"
 }
 
 func (c *Config) validate() error {

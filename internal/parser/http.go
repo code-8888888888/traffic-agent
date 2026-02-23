@@ -49,8 +49,9 @@ type sslFlowKey struct {
 }
 
 type flowBuf struct {
-	data    []byte
-	updated time.Time
+	data          []byte
+	updated       time.Time
+	lastParsedAt  time.Time // set when a complete message was last emitted
 }
 
 // Parser accumulates per-flow payloads and emits HTTP traffic events.
@@ -100,7 +101,14 @@ func (p *Parser) HandlePacket(ev *types.RawPacketEvent) {
 	p.mu.Unlock()
 
 	if isClientPort(ev.DstPort) {
-		p.tryParseRequest(key, data, ev)
+		// Skip if this flow was parsed very recently (suppresses TCP retransmit duplicates).
+		p.mu.Lock()
+		cooldown := !p.bufs[key].lastParsedAt.IsZero() &&
+			time.Since(p.bufs[key].lastParsedAt) < 3*time.Second
+		p.mu.Unlock()
+		if !cooldown {
+			p.tryParseRequest(key, data, ev)
+		}
 	} else if isServerPort(ev.SrcPort) {
 		p.tryParseResponse(key, data, ev)
 	}
@@ -192,6 +200,13 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 // ---- Internal parse helpers (TC packet events) ----
 
 func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEvent) {
+	// HTTP/2 cleartext sends a connection preface starting with "PRI * HTTP/2.0".
+	// We can't parse HTTP/2 binary framing; skip silently to avoid log noise.
+	if bytes.HasPrefix(data, []byte("PRI * HTTP/2.0")) {
+		p.deleteBuf(key)
+		return
+	}
+
 	fields, ok := parseHTTPRequestFields(data)
 	if !ok {
 		return
@@ -212,7 +227,12 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 		BodySnippet:    fields.body,
 	}
 	p.sink(te)
-	p.deleteBuf(key)
+	p.mu.Lock()
+	if fb := p.bufs[key]; fb != nil {
+		fb.data = nil
+		fb.lastParsedAt = time.Now()
+	}
+	p.mu.Unlock()
 }
 
 func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketEvent) {
@@ -235,7 +255,12 @@ func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketE
 		BodySnippet:     fields.body,
 	}
 	p.sink(te)
-	p.deleteBuf(key)
+	p.mu.Lock()
+	if fb := p.bufs[key]; fb != nil {
+		fb.data = nil
+		fb.lastParsedAt = time.Now()
+	}
+	p.mu.Unlock()
 }
 
 func (p *Parser) deleteBuf(key flowKey) {
