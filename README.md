@@ -232,20 +232,12 @@ node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
 
 ### Firefox — startup order
 
-Firefox loads `libnspr4.so` only after it establishes its first TLS connection (lazy via `libxul.so`). The agent discovers SSL libraries by scanning `/proc/*/maps` at startup, so:
+Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent scans `/proc/*/maps` at startup **and re-scans every 10 seconds**, so startup order does not matter:
 
-1. Start Firefox first and let it fully initialize (captive portal check establishes a TLS connection)
-2. Start the agent — it will find and attach to `libnspr4.so` across all Firefox processes
-3. All subsequent Firefox HTTPS traffic is intercepted automatically
+- **Agent starts first** — the periodic re-scan will find `libnspr4.so` within 10 seconds after Firefox establishes its first connection and loads the library.
+- **Firefox starts first** — `libnspr4.so` is found at the next agent scan cycle (or immediately at startup if Firefox is already running).
 
-```bash
-# Start Firefox (background, let it initialize)
-/snap/firefox/current/usr/lib/firefox/firefox --headless --no-remote https://example.com &
-sleep 15   # wait for libnspr4.so to be loaded
-
-# Now start the agent
-sudo ./bin/traffic-agent --config config/config.yaml
-```
+In both cases all subsequent Firefox traffic on the library is intercepted automatically without restarting either process.
 
 ### Example output
 
@@ -267,28 +259,46 @@ sudo ./bin/traffic-agent --config config/config.yaml
 {"timestamp":"2026-02-23T08:12:24.026492630Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"ingress","pid":495514,"process_name":"MainThread","status_code":200,"response_headers":{"Content-Length":"201","Content-Type":"application/json"},"body_snippet":"{\n  \"url\": \"https://httpbin.org/get\"\n}\n","tls_intercepted":true}
 ```
 
-**Firefox 146 (NSS/NSPR / `libnspr4.so`) — captive portal and connectivity checks captured on startup**
+**Firefox 146 (NSS/NSPR / `libnspr4.so`) — startup connectivity checks and a WebSocket over TLS**
 ```json
-{"timestamp":"2026-02-23T08:38:43.874223516Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":526318,"process_name":"Socket Thread","http_method":"IPRI","url":"*","tls_intercepted":true}
-{"timestamp":"2026-02-23T08:38:44.601475858Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":36994,"dst_port":80,"protocol":"TCP","direction":"egress","pid":526318,"process_name":"firefox","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"}}
-{"timestamp":"2026-02-23T08:38:44.628603675Z","src_ip":"34.107.221.82","dst_ip":"192.168.68.61","src_port":80,"dst_port":36994,"protocol":"TCP","direction":"ingress","pid":526318,"process_name":"firefox","status_code":200,"response_headers":{"Content-Length":"90","Content-Type":"text/html"},"body_snippet":"\u003cmeta http-equiv=\"refresh\" content=\"0;url=https://support.mozilla.org/kb/captive-portal\"/\u003e"}
-{"timestamp":"2026-02-23T08:38:47.910005520Z","src_ip":"192.168.68.61","dst_ip":"34.107.221.82","src_port":51470,"dst_port":80,"protocol":"TCP","direction":"egress","pid":523945,"process_name":"firefox","http_method":"GET","url":"/success.txt?ipv4","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"}}
-{"timestamp":"2026-02-23T08:38:47.917333680Z","src_ip":"34.107.221.82","dst_ip":"192.168.68.61","src_port":80,"dst_port":51470,"protocol":"TCP","direction":"ingress","pid":523945,"process_name":"firefox","status_code":200,"response_headers":{"Content-Length":"8","Content-Type":"text/plain"},"body_snippet":"success\n"}
+{"timestamp":"2026-02-23T10:11:36Z","src_ip":"192.168.68.59","dst_ip":"34.107.221.82","src_port":48540,"dst_port":80,"protocol":"TCP","direction":"egress","pid":638059,"process_name":"firefox","http_method":"GET","url":"/canonical.html","request_headers":{"Host":"detectportal.firefox.com","User-Agent":"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0"}}
+{"timestamp":"2026-02-23T10:11:36Z","src_ip":"34.107.221.82","dst_ip":"192.168.68.59","src_port":80,"dst_port":48540,"protocol":"TCP","direction":"ingress","pid":638059,"process_name":"firefox","status_code":200,"response_headers":{"Content-Length":"90","Content-Type":"text/html"},"body_snippet":"\u003cmeta http-equiv=\"refresh\" content=\"0;url=https://support.mozilla.org/kb/captive-portal\"/\u003e"}
+{"timestamp":"2026-02-23T10:11:37Z","src_ip":"","dst_ip":"","src_port":0,"dst_port":0,"protocol":"TLS","direction":"egress","pid":638059,"process_name":"Socket Thread","http_method":"GET","url":"/","request_headers":{"Host":"push.services.mozilla.com","Connection":"Upgrade","Upgrade":"websocket","Sec-Websocket-Protocol":"push-notification","Sec-Websocket-Version":"13"},"tls_intercepted":true}
 ```
 
-> **Note on Firefox process names:** Firefox uses a multi-process architecture. The main process comm is `"firefox"` (shown on TCP events resolved via `/proc/net/tcp`). The dedicated network I/O process comm is `"Socket Thread"` (shown on TLS/NSS events). The `IPRI` method on the first TLS event is Firefox's HTTP/2 upgrade preface (`PRI * HTTP/2.0`) — see the HTTP/2 caveat below.
+> **Note on Firefox process names:** Firefox uses a multi-process architecture. The main process comm is `"firefox"` (shown on TCP events resolved via `/proc/net/tcp`). The dedicated network I/O thread comm is `"Socket Thread"` (shown on TLS/NSPR events).
+
+> **Note on Firefox HTTPS:** Most Firefox HTTPS requests use HTTP/2 (negotiated via TLS ALPN), which produces no events — binary frames are silently dropped. HTTP/1.1 over TLS **is** captured: WebSocket upgrades (shown above), connections to HTTP/1.1-only servers, and any other flow Firefox negotiates without HTTP/2. Plain HTTP (port 80) is always captured by the TC hook regardless.
 
 > **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
 
-### HTTP/2 caveat
+### HTTP/2 limitation
 
-By default, curl negotiates HTTP/2 for HTTPS connections. HTTP/2 uses binary HPACK framing which is not parseable by the HTTP/1.1 parser. Force HTTP/1.1 to get clean events:
+Modern HTTPS connections typically negotiate **HTTP/2** via TLS ALPN. HTTP/2 uses binary HPACK framing which is not parseable by the HTTP/1.1 parser. This affects both capture paths:
+
+| Capture path | HTTP/1.1 over TLS | HTTP/2 over TLS |
+|---|---|---|
+| TC hook (port 80 cleartext) | ✅ captured | ✅ h2c preface silently dropped |
+| SSL uprobe (OpenSSL / NSPR / …) | ✅ captured | ✅ PRI preface silently dropped; subsequent binary frames produce no events |
+
+**curl** defaults to HTTP/2 when the server supports it. Force HTTP/1.1 to capture both request and response:
 
 ```bash
 curl --http1.1 https://example.com/api
 ```
 
-HTTP/2 support is tracked in [Known Limitations](#known-limitations).
+**Firefox** negotiates HTTP/2 for virtually all regular HTTPS browsing. The SSL/NSPR uprobe fires correctly, but the captured payload is HTTP/2 binary framing. Traffic that Firefox sends as HTTP/1.1 over TLS **is** captured — for example, WebSocket upgrade handshakes (`Upgrade: websocket`) and connections to HTTP/1.1-only servers:
+
+```json
+{"protocol":"TLS","tls_intercepted":true,"process_name":"Socket Thread",
+ "http_method":"GET","url":"/",
+ "request_headers":{"Host":"push.services.mozilla.com","Upgrade":"websocket",
+                     "Sec-Websocket-Protocol":"push-notification",...}}
+```
+
+Plain HTTP from Firefox (port 80, no TLS) is always captured by the TC hook regardless of version.
+
+HTTP/2 frame parsing (HPACK headers + DATA frames) is tracked in [Known Limitations](#known-limitations).
 
 ### Target-specific attachment
 
@@ -710,7 +720,7 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
 
 1. **IPv4 only** — The TC BPF program skips non-`ETH_P_IP` frames. IPv6 support requires adding `ip6hdr` parsing.
 
-2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. When using SSL uprobes with curl, pass `--http1.1` to force HTTP/1.1 negotiation. HTTP/2 support would require an additional HPACK framing layer on top of the SSL uprobe capture path.
+2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. Both the TC and SSL uprobe paths silently discard the HTTP/2 connection preface (`PRI * HTTP/2.0`) and produce no events for subsequent binary frames. In practice this means: most modern HTTPS browsing with Firefox or Chrome produces no events (HTTP/2 via TLS ALPN); curl defaults to HTTP/2 and must be passed `--http1.1`; HTTP/1.1-only servers, WebSocket upgrade handshakes, and plain HTTP (port 80) are always captured. Full HTTP/2 support would require HPACK decompression and frame parsing on top of the SSL uprobe capture path.
 
 3. **TCP sequence numbers not captured** — Payloads are accumulated in arrival order. Out-of-order segment reassembly is not supported. In practice, in-order delivery is the common case on local networks.
 
