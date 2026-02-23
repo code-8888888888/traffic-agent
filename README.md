@@ -3,7 +3,7 @@
 A Go application that passively intercepts and inspects **HTTP and HTTPS** network traffic at the kernel level using **eBPF**, without acting as a proxy or requiring any changes to client applications.
 
 - **HTTP** — captured via TC (Traffic Control) eBPF hooks on the network interface
-- **HTTPS** — captured via eBPF uprobes on OpenSSL's `SSL_read`/`SSL_write`, intercepting plaintext before encryption and after decryption with no certificate injection or MITM
+- **HTTPS / TLS** — captured via eBPF uprobes on SSL library write/read functions, intercepting plaintext before encryption and after decryption with no certificate injection or MITM; automatically detects **OpenSSL, BoringSSL, GnuTLS, and NSS/NSPR** without any per-library configuration
 
 ---
 
@@ -68,7 +68,7 @@ A Go application that passively intercepts and inspects **HTTP and HTTPS** netwo
 |------|-----------|-----------------|
 | TC ingress | Inbound | Server → client responses (status code, headers, body) |
 | TC egress | Outbound | Client → server requests (method, URL, headers, body) |
-| uprobe SSL_write / SSL_read | Both | Plaintext before/after OpenSSL encryption (TLS interception, optional) |
+| uprobe SSL write / read | Both | Plaintext before/after TLS encryption; auto-attaches to **OpenSSL** (`SSL_write/read`), **BoringSSL** (`SSL_write/read`), **GnuTLS** (`gnutls_record_send/recv`), **NSS/NSPR** (`PR_Write/PR_Read`) |
 
 ---
 
@@ -165,30 +165,49 @@ sudo ./bin/traffic-agent --config config/config.yaml \
 
 ## HTTPS / TLS Interception
 
-The agent hooks into OpenSSL's `SSL_write` and `SSL_read` functions via eBPF uprobes to capture plaintext **before encryption** (outbound) and **after decryption** (inbound). No certificate injection, no MITM proxy, and no changes to the client are required.
+The agent hooks into SSL library write/read functions via eBPF uprobes to capture plaintext **before encryption** (outbound) and **after decryption** (inbound). No certificate injection, no MITM proxy, and no changes to the client are required.
 
 ### How it works
 
 ```
-curl → SSL_write(plaintext request) → [uprobe fires, copies to ring buffer]
-                                     → OpenSSL encrypts → sends over wire
+app → SSL_write(plaintext) → [uprobe fires → ring buffer]
+                           → library encrypts → wire
 
-wire → OpenSSL decrypts → SSL_read(plaintext response) → [uprobe fires, copies to ring buffer]
+wire → library decrypts → SSL_read(plaintext) → [uprobe fires → ring buffer]
 ```
 
-The captured plaintext is fed into the same HTTP/1.1 parser as TC-captured traffic, producing `TrafficEvent` JSON with `"protocol": "TLS"` and `"tls_intercepted": true`.
+The captured plaintext is fed into the HTTP/1.1 parser, producing `TrafficEvent` JSON with `"protocol": "TLS"` and `"tls_intercepted": true`.
+
+### Supported SSL libraries
+
+All four libraries share the same calling convention — `(context, buf, len)` with `buf` at register PARM2 and `len` at PARM3 — so a single BPF program covers all of them without any code changes.
+
+| Library | Shared object | Hooked functions | Common users |
+|---------|--------------|-----------------|--------------|
+| OpenSSL | `libssl.so` | `SSL_write` / `SSL_read` | curl, wget, nginx, Python, Node.js |
+| BoringSSL | `libboringssl.so` | `SSL_write` / `SSL_read` | Some Chromium builds, gRPC |
+| GnuTLS | `libgnutls.so` | `gnutls_record_send` / `gnutls_record_recv` | wget, glib networking tools |
+| NSS / NSPR | `libnspr4.so` | `PR_Write` / `PR_Read` | Firefox, Thunderbird |
+
+### Auto-detection
+
+When `tls.enabled: true` with no `pids` or `processes` specified, the agent scans **all running processes** via `/proc/*/maps` at startup. For every unique SSL shared library found, it attaches system-wide uprobes (PID 0) so that even processes that start *after* the agent are covered for libraries already attached.
+
+```bash
+# Example startup log showing auto-detection
+[tls] attached global SSL uprobes to /usr/lib/aarch64-linux-gnu/libssl.so.3
+[tls] attached global SSL uprobes to /usr/lib/x86_64-linux-gnu/libgnutls.so.30
+```
 
 ### Enabling TLS interception
 
-Set `tls.enabled: true` in `config.yaml` (it is enabled in the default config):
+Set `tls.enabled: true` in `config.yaml` (enabled in the default config):
 
 ```yaml
 tls:
   enabled: true
-  # No pids or processes = attach globally to all processes using libssl.so
+  # No pids or processes = attach globally to all processes using any SSL library
 ```
-
-When no `pids` or `processes` are specified, the agent attaches system-wide to `libssl.so.3`, intercepting all processes that use OpenSSL on the machine.
 
 ### Testing
 
@@ -235,9 +254,39 @@ tls:
   #   - 1234
 ```
 
+### BoringSSL — statically linked executables
+
+Some applications (e.g., Chromium, some gRPC builds) bundle BoringSSL as a **static library** inside the binary rather than a shared `.so`. The agent handles three cases automatically:
+
+| Case | Detection | Action |
+|------|-----------|--------|
+| BoringSSL as a `.so` | Found in `/proc/<pid>/maps` | Attaches by symbol name like any other SSL library |
+| Static BoringSSL with ELF symbols | Scans `.symtab`/`.dynsym` of the executable | Attaches by symbol name to the executable |
+| Static BoringSSL, fully stripped | No symbols present | Requires explicit file offsets in config |
+
+For **stripped binaries** (e.g., a production Chromium snap), find the offsets from a debug build of the same version and specify them in config:
+
+```yaml
+tls:
+  enabled: true
+  boringssl_executables:
+    - path: /snap/chromium/current/usr/lib/chromium-browser/chromium
+      process_name: chrome
+      ssl_write_offset: 0x1234abc0   # file offset of SSL_write in the binary
+      ssl_read_offset:  0x1234def0   # file offset of SSL_read in the binary
+```
+
+To find the offsets from a symbol-bearing build:
+
+```bash
+# From a debug build or non-stripped binary:
+readelf -sW /path/to/chromium | grep -E 'SSL_write|SSL_read'
+# Note the Value (virtual address), then subtract the load address from /proc/<pid>/maps
+```
+
 ### Go TLS limitation
 
-Go programs use the built-in `crypto/tls` package, which does **not** link against OpenSSL. SSL uprobes do not cover Go HTTPS clients or servers. See [Known Limitations](#known-limitations).
+Go programs use the built-in `crypto/tls` package, which does **not** link against OpenSSL or any of the above libraries. SSL uprobes do not cover Go HTTPS clients or servers. See [Known Limitations](#known-limitations).
 
 ---
 
@@ -354,17 +403,20 @@ output:
 
 # -----------------------------------------------------------------------
 # TLS / SSL plaintext interception via eBPF uprobes  (optional)
-# Hooks into OpenSSL's SSL_read / SSL_write to capture plaintext
+# Hooks into SSL library write/read functions to capture plaintext
 # before encryption and after decryption — no certificate injection.
+# Automatically detects OpenSSL, BoringSSL, GnuTLS, and NSS/NSPR
+# by scanning /proc/*/maps at startup. No per-library configuration needed.
 # -----------------------------------------------------------------------
 
 tls:
   # Enable SSL uprobe interception.
-  # Default: false
-  enabled: false
+  # Default: true
+  enabled: true
 
   # Attach uprobes only to these process IDs.
-  # If empty (and enabled: true), attaches to all processes using libssl.
+  # If empty (and enabled: true), attaches globally to all processes
+  # that use any known SSL library (OpenSSL, BoringSSL, GnuTLS, NSS/NSPR).
   # Default: [] (all processes)
   # pids:
   #   - 1234
@@ -375,10 +427,21 @@ tls:
   #   - nginx
   #   - envoy
 
-  # Explicit path to libssl.so.
-  # Leave empty to auto-detect via /proc/<pid>/maps (recommended).
-  # Default: "" (auto-detect)
-  # libssl_path: /usr/lib/x86_64-linux-gnu/libssl.so.3
+  # Static BoringSSL executables (for applications that bundle BoringSSL
+  # as a static library rather than a shared .so).
+  #
+  # Three attachment modes (tried automatically in order):
+  #   1. BoringSSL shipped as a .so — found via /proc/maps, no config needed
+  #   2. Static BoringSSL with ELF symbols — executable scanned at startup
+  #   3. Static BoringSSL, fully stripped — requires ssl_write_offset / ssl_read_offset below
+  #
+  # Only needed for case 3 (stripped production binaries such as Chromium snap).
+  # Default: [] (disabled)
+  # boringssl_executables:
+  #   - path: /snap/chromium/current/usr/lib/chromium-browser/chromium
+  #     process_name: chrome   # used only for log messages
+  #     ssl_write_offset: 0x0  # file offset of SSL_write; find from a debug build
+  #     ssl_read_offset:  0x0  # file offset of SSL_read
 
 
 # -----------------------------------------------------------------------
@@ -600,10 +663,12 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
 
 5. **BPF ring buffer size** — The TC ring buffer is 256 KiB (`max_entries` in `bpf/tc_capture.c`). Under sustained high throughput, events may be dropped. Increase `max_entries` and recompile if needed.
 
-6. **Go TLS not intercepted** — Go's `crypto/tls` does not link against OpenSSL, so the SSL uprobes do not cover Go HTTPS clients or servers. A separate uretprobe on `crypto/tls.(*Conn).Read/Write` is planned.
+6. **Go TLS not intercepted** — Go's `crypto/tls` does not link against OpenSSL or any of the other supported SSL libraries, so SSL uprobes do not cover Go HTTPS clients or servers. A separate uretprobe on `crypto/tls.(*Conn).Read/Write` is planned.
 
-7. **Per-interface attachment** — TC hooks attach to one interface. Capture on multiple interfaces requires running multiple instances with different configs, or extending the code to iterate over interfaces.
+7. **Stripped static BoringSSL** — Applications that statically link a stripped BoringSSL (e.g., production Chromium snap builds) have no ELF symbols for `SSL_write`/`SSL_read`. These require finding the exact file offsets from a matching debug build and providing them via `tls.boringssl_executables` in config. There is no automatic way to locate the functions in a fully stripped binary.
 
-8. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
+8. **Per-interface attachment** — TC hooks attach to one interface. Capture on multiple interfaces requires running multiple instances with different configs, or extending the code to iterate over interfaces.
 
-9. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
+9. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
+
+10. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
