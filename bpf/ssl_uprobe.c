@@ -28,11 +28,13 @@ char __license[] SEC("license") = "GPL";
 
 /**
  * ssl_events - Ring buffer for plaintext SSL data sent to userspace.
- * 512 KiB to accommodate larger TLS records.
+ * 4 MiB: browsers (Firefox, Chrome) make hundreds of PR_Write/PR_Read
+ * calls per second under HTTP/2; a larger buffer avoids event drops when
+ * the userspace reader momentarily falls behind.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 512 * 1024);
+    __uint(max_entries, 4 * 1024 * 1024);
 } ssl_events SEC(".maps");
 
 /**

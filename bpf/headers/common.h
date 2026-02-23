@@ -29,7 +29,13 @@
 /* Max sizes — must be a power of 2 to enable the verifier-required mask trick
  * (copy_len &= MAX_PAYLOAD_SIZE - 1). Actual max captured payload is 2047 bytes. */
 #define MAX_PAYLOAD_SIZE 2048
-#define MAX_SSL_DATA_SIZE 4096
+/* MAX_SSL_DATA_SIZE: bytes copied per SSL_write/SSL_read uretprobe call.
+ * Must match BodySnippetMaxLen in internal/types/types.go (512).
+ * Keeping this small is critical for performance: bpf_probe_read_user runs
+ * in the application's thread context (Firefox, etc.) on every network call,
+ * so copying more data than the parser can use directly adds latency to the
+ * intercepted process.  512 bytes is enough for any HTTP/1.1 header block. */
+#define MAX_SSL_DATA_SIZE 512
 #define TASK_COMM_LEN 16
 
 /* Direction flags */

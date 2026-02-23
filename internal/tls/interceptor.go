@@ -22,7 +22,8 @@ import (
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
 
-const maxSSLDataSize = 4096
+// maxSSLDataSize must match MAX_SSL_DATA_SIZE in bpf/headers/common.h.
+const maxSSLDataSize = 512
 
 // rawSSLEvent mirrors struct ssl_event from bpf/ssl_uprobe.c.
 type rawSSLEvent struct {
