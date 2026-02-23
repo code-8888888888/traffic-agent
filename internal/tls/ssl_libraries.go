@@ -27,6 +27,12 @@ type sslLibDef struct {
 	namePattern string // matched against filepath.Base(libPath)
 	writeFunc   string
 	readFunc    string
+	// tailCall indicates that writeFunc (and readFunc) are indirect tail-calls
+	// (e.g. ARM64 "br x3") rather than normal functions with a RET instruction.
+	// When true, uretprobes will never fire, so the agent uses an entry-only
+	// capture program for writes and skips read probes entirely.
+	// NSS/NSPR's PR_Write and PR_Read are the primary examples.
+	tailCall bool
 }
 
 // knownSSLLibDefs is the table of all SSL/TLS libraries whose I/O functions
@@ -38,8 +44,10 @@ var knownSSLLibDefs = []sslLibDef{
 	{namePattern: "libboringssl", writeFunc: "SSL_write", readFunc: "SSL_read"},
 	// GnuTLS — used by wget, glib networking, some system tools
 	{namePattern: "libgnutls.so", writeFunc: "gnutls_record_send", readFunc: "gnutls_record_recv"},
-	// NSS via NSPR — used by Firefox, Thunderbird
-	{namePattern: "libnspr4.so", writeFunc: "PR_Write", readFunc: "PR_Read"},
+	// NSS via NSPR — used by Firefox, Thunderbird.
+	// PR_Write and PR_Read are 3-instruction indirect tail-calls on ARM64;
+	// uretprobes will never fire.  Use entry-only write capture instead.
+	{namePattern: "libnspr4.so", writeFunc: "PR_Write", readFunc: "PR_Read", tailCall: true},
 }
 
 // sslLibFound holds a resolved shared-library path and the function names to
@@ -48,6 +56,7 @@ type sslLibFound struct {
 	path      string
 	writeFunc string
 	readFunc  string
+	tailCall  bool
 }
 
 // findSSLLibsForPID reads /proc/<pid>/maps and returns every loaded shared
@@ -80,6 +89,7 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 					path:      libPath,
 					writeFunc: def.writeFunc,
 					readFunc:  def.readFunc,
+					tailCall:  def.tailCall,
 				})
 				seen[libPath] = true
 				break

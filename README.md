@@ -230,14 +230,20 @@ node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
 # then restart the agent; any subsequent Firefox HTTPS traffic will be intercepted
 ```
 
-### Firefox — startup order
+### Firefox — startup order and limitations
 
 Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent scans `/proc/*/maps` at startup **and re-scans every 10 seconds**, so startup order does not matter:
 
 - **Agent starts first** — the periodic re-scan will find `libnspr4.so` within 10 seconds after Firefox establishes its first connection and loads the library.
 - **Firefox starts first** — `libnspr4.so` is found at the next agent scan cycle (or immediately at startup if Firefox is already running).
 
-In both cases all subsequent Firefox traffic on the library is intercepted automatically without restarting either process.
+**ARM64 / aarch64 note:** On ARM64, `PR_Write` and `PR_Read` in `libnspr4.so` are 3-instruction indirect tail-calls (`br x3`, not `blr x3`), so a `uretprobe` on them never fires. The agent automatically detects this and uses an entry-only write probe (`uprobe/SSL_write_entry_cap`) for NSPR, which reads the plaintext buffer at function entry. Read capture is not available for NSPR on ARM64.
+
+**Firefox snap on Ubuntu:** When Firefox is installed as a snap package, its processes run inside the snap sandbox. The Socket Process (which handles network I/O) has `NoNewPrivs=1` and multiple seccomp filter layers, and is already ptrace-traced by the Firefox sandbox broker — only one ptrace tracer is allowed at a time, which can prevent eBPF uprobe breakpoints from being inserted in that process. Traffic from non-sandboxed helper processes (e.g., the main Firefox process, content processes) may still be captured.
+
+**HTTP/2 traffic:** Most Firefox HTTPS browsing uses HTTP/2 (negotiated via ALPN), which produces binary HPACK frames that the HTTP/1.1 parser discards. See [HTTP/2 limitation](#http2-limitation) below.
+
+**Cached responses:** Firefox aggressively caches HTTP responses. If a URL was visited recently, no new TCP connection or TLS handshake is made — the agent captures nothing because no TLS write/read occurs on the wire.
 
 ### Example output
 
@@ -737,3 +743,7 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
 9. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
 
 10. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
+
+11. **Firefox snap sandbox** — Firefox installed as a snap on Ubuntu runs its Socket Process with `NoNewPrivs=1`, multiple seccomp filter layers, and an existing ptrace tracer (the snap broker). This can prevent eBPF uprobe breakpoints from being inserted into the sandboxed process. Plain HTTP (port 80) and HTTP/1.1 over TLS from non-sandboxed Firefox processes (e.g., WebSocket connections via the main process) are still captured.
+
+12. **NSPR read capture not available on ARM64** — `PR_Read` in `libnspr4.so` is an indirect tail-call on ARM64 (`br x3`), so no uretprobe can fire on it. Only write (egress) direction is captured for NSPR. Inbound HTTPS responses from Firefox are not captured via the NSPR path; they may still appear on the TC hook if the connection is plain HTTP (port 80).

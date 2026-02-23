@@ -59,10 +59,11 @@ type SSLUprobeSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type SSLUprobeProgramSpecs struct {
-	UprobeSslReadEntry   *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
-	UprobeSslWriteEntry  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry"`
-	UretprobeSslReadRet  *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ret"`
-	UretprobeSslWriteRet *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ret"`
+	UprobeSslReadEntry     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslWriteEntry    *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry"`
+	UprobeSslWriteEntryCap *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry_cap"`
+	UretprobeSslReadRet    *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ret"`
+	UretprobeSslWriteRet   *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ret"`
 }
 
 // SSLUprobeMapSpecs contains maps before they are loaded into the kernel.
@@ -110,16 +111,18 @@ func (m *SSLUprobeMaps) Close() error {
 //
 // It can be passed to LoadSSLUprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SSLUprobePrograms struct {
-	UprobeSslReadEntry   *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
-	UprobeSslWriteEntry  *ebpf.Program `ebpf:"uprobe_ssl_write_entry"`
-	UretprobeSslReadRet  *ebpf.Program `ebpf:"uretprobe_ssl_read_ret"`
-	UretprobeSslWriteRet *ebpf.Program `ebpf:"uretprobe_ssl_write_ret"`
+	UprobeSslReadEntry     *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslWriteEntry    *ebpf.Program `ebpf:"uprobe_ssl_write_entry"`
+	UprobeSslWriteEntryCap *ebpf.Program `ebpf:"uprobe_ssl_write_entry_cap"`
+	UretprobeSslReadRet    *ebpf.Program `ebpf:"uretprobe_ssl_read_ret"`
+	UretprobeSslWriteRet   *ebpf.Program `ebpf:"uretprobe_ssl_write_ret"`
 }
 
 func (p *SSLUprobePrograms) Close() error {
 	return _SSLUprobeClose(
 		p.UprobeSslReadEntry,
 		p.UprobeSslWriteEntry,
+		p.UprobeSslWriteEntryCap,
 		p.UretprobeSslReadRet,
 		p.UretprobeSslWriteRet,
 	)

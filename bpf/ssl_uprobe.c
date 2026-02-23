@@ -210,6 +210,62 @@ cleanup:
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * SSL_write entry-only capture (for tail-calling write functions)
+ *
+ * Some SSL/TLS libraries implement their write function as an indirect
+ * tail-call rather than a proper function call with a RET instruction.
+ * NSS/NSPR's PR_Write is the canonical example on ARM64:
+ *
+ *   PR_Write(fd, buf, amount):
+ *     ldr x8, [x0]        ; fd->methods
+ *     ldr x3, [x8, #24]   ; methods->write (function pointer)
+ *     br  x3              ; tail-call — no return frame pushed, no RET
+ *
+ * Because BR does not push a return address, a uretprobe registered on
+ * PR_Write will never fire.  The entry uprobe DOES fire, and at that
+ * point the plaintext is already present in PARM2 (x1=buf, ARM64), so
+ * we read it immediately without stashing args for a uretprobe.
+ *
+ * Compatible calling convention (same as SSL_write):
+ *   int fn(void *ctx, const void *buf, int num)
+ *   arg1 (x0) = context pointer (ignored)
+ *   arg2 (x1) = buf  — plaintext data to write
+ *   arg3 (x2) = num  — byte count
+ * --------------------------------------------------------------------- */
+
+SEC("uprobe/SSL_write_entry_cap")
+int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
+{
+    void  *buf = (void *)PT_REGS_PARM2(ctx);
+    __u32  num = (__u32)PT_REGS_PARM3(ctx);
+
+    if (num == 0)
+        return 0;
+
+    struct ssl_event *ev = bpf_ringbuf_reserve(&ssl_events, sizeof(*ev), 0);
+    if (!ev)
+        return 0;
+
+    ev->timestamp_ns = bpf_ktime_get_ns();
+    ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
+    ev->tid          = (__u32)bpf_get_current_pid_tgid();
+    ev->uid          = (__u32)bpf_get_current_uid_gid();
+    ev->is_read      = 0;
+    bpf_get_current_comm(ev->comm, sizeof(ev->comm));
+
+    __u32 data_len = num > MAX_SSL_DATA_SIZE ? MAX_SSL_DATA_SIZE : num;
+    ev->data_len = data_len;
+
+    if (bpf_probe_read_user(ev->data, data_len, buf) < 0) {
+        bpf_ringbuf_discard(ev, 0);
+        return 0;
+    }
+
+    bpf_ringbuf_submit(ev, 0);
+    return 0;
+}
+
 /*
  * TODO: Go crypto/tls interception
  *

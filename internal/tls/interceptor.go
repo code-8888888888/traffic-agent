@@ -168,7 +168,7 @@ func (i *Interceptor) AttachToPID(pid int) error {
 func (i *Interceptor) attachToPID(pid int) error {
 	n := 0
 	for _, lib := range findSSLLibsForPID(pid) {
-		if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid); err != nil {
+		if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid, lib.tailCall); err != nil {
 			log.Printf("[tls] PID %d %s: %v", pid, filepath.Base(lib.path), err)
 			continue
 		}
@@ -220,7 +220,7 @@ func (i *Interceptor) attachGlobal() error {
 			if seen {
 				continue
 			}
-			if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0); err != nil {
+			if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0, lib.tailCall); err != nil {
 				log.Printf("[tls] %s: %v", filepath.Base(lib.path), err)
 			}
 		}
@@ -250,24 +250,41 @@ func (i *Interceptor) attachGlobal() error {
 	return nil
 }
 
-// attachToLib opens path and attaches the four SSL write/read uprobe programs
+// attachToLib opens path and attaches SSL write/read uprobe programs
 // using writeFunc and readFunc as the symbol names.
 // pid=0 attaches system-wide; pid>0 scopes the probes to that process only.
-func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int) error {
+//
+// tailCall must be set for libraries whose write/read functions are indirect
+// tail-calls (br x3 on ARM64) rather than normal functions with a RET.
+// In that case uretprobes will never fire, so the agent uses an entry-only
+// write capture program and skips read probes entirely.
+// NSS/NSPR (libnspr4.so) is the canonical example.
+func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int, tailCall bool) error {
 	ex, err := link.OpenExecutable(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 
-	probes := []struct {
+	type probeSpec struct {
 		sym  string
 		prog *ebpf.Program
 		ret  bool
-	}{
-		{writeFunc, i.objs.UprobeSslWriteEntry, false},
-		{writeFunc, i.objs.UretprobeSslWriteRet, true},
-		{readFunc, i.objs.UprobeSslReadEntry, false},
-		{readFunc, i.objs.UretprobeSslReadRet, true},
+	}
+	var probes []probeSpec
+	if tailCall {
+		// PR_Write / PR_Read are 3-instruction tail-calls on ARM64.
+		// Only attach an entry-only write probe; reads are not interceptable
+		// without private NSS symbol access.
+		probes = []probeSpec{
+			{writeFunc, i.objs.UprobeSslWriteEntryCap, false},
+		}
+	} else {
+		probes = []probeSpec{
+			{writeFunc, i.objs.UprobeSslWriteEntry, false},
+			{writeFunc, i.objs.UretprobeSslWriteRet, true},
+			{readFunc, i.objs.UprobeSslReadEntry, false},
+			{readFunc, i.objs.UretprobeSslReadRet, true},
+		}
 	}
 
 	var opts *link.UprobeOptions
@@ -287,12 +304,16 @@ func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int) err
 		i.links = append(i.links, l)
 	}
 
+	mode := "entry+return"
+	if tailCall {
+		mode = "entry-only (tail-call)"
+	}
 	if pid == 0 {
-		log.Printf("[tls] attached global uprobes to %s (%s/%s)",
-			filepath.Base(path), writeFunc, readFunc)
+		log.Printf("[tls] attached global uprobes to %s (%s/%s) [%s]",
+			filepath.Base(path), writeFunc, readFunc, mode)
 	} else {
-		log.Printf("[tls] attached uprobes to PID %d via %s (%s/%s)",
-			pid, filepath.Base(path), writeFunc, readFunc)
+		log.Printf("[tls] attached uprobes to PID %d via %s (%s/%s) [%s]",
+			pid, filepath.Base(path), writeFunc, readFunc, mode)
 	}
 	return nil
 }
