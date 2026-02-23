@@ -197,14 +197,29 @@ func parsePacketEvent(data []byte) (*types.RawPacketEvent, error) {
 		payloadEnd = len(data)
 	}
 
+	srcIP := uint32ToIP(raw.SrcIP)
+	dstIP := uint32ToIP(raw.DstIP)
+
+	// Best-effort PID/comm lookup from /proc/net/tcp.
+	// For egress: we are the sender, so local=src. For ingress: local=dst.
+	var pid uint32
+	var comm string
+	if raw.Direction == 1 { // DIR_EGRESS
+		pid, comm = lookupTCPProcess(srcIP, raw.SrcPort, dstIP, raw.DstPort)
+	} else {
+		pid, comm = lookupTCPProcess(dstIP, raw.DstPort, srcIP, raw.SrcPort)
+	}
+
 	return &types.RawPacketEvent{
 		TimestampNS: raw.TimestampNS,
-		SrcIP:       uint32ToIP(raw.SrcIP),
-		DstIP:       uint32ToIP(raw.DstIP),
+		SrcIP:       srcIP,
+		DstIP:       dstIP,
 		SrcPort:     raw.SrcPort,
 		DstPort:     raw.DstPort,
 		Direction:   types.Direction(raw.Direction),
 		Protocol:    raw.Protocol,
+		PID:         pid,
+		ProcessName: comm,
 		Payload:     append([]byte(nil), data[28:payloadEnd]...),
 	}, nil
 }

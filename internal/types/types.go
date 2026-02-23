@@ -32,6 +32,10 @@ type RawPacketEvent struct {
 	DstPort     uint16
 	Direction   Direction
 	Protocol    uint8
+	// PID and ProcessName are populated for egress packets (process context).
+	// For ingress packets (softirq context), PID is 0 and ProcessName is empty.
+	PID         uint32
+	ProcessName string
 	Payload     []byte
 }
 
