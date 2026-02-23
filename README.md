@@ -481,6 +481,8 @@ Each captured HTTP transaction produces one or two JSON lines on stdout (and/or 
   "dst_port": 80,
   "protocol": "TCP",
   "direction": "egress",
+  "pid": 12345,
+  "process_name": "curl",
   "http_method": "POST",
   "url": "/api/data",
   "request_headers": {
@@ -505,6 +507,8 @@ Each captured HTTP transaction produces one or two JSON lines on stdout (and/or 
   "dst_port": 42126,
   "protocol": "TCP",
   "direction": "ingress",
+  "pid": 12345,
+  "process_name": "curl",
   "status_code": 200,
   "response_headers": {
     "Content-Length": "256",
@@ -533,8 +537,8 @@ Each captured HTTP transaction produces one or two JSON lines on stdout (and/or 
 | `status_code` | number | HTTP response status code — responses only |
 | `response_headers` | object | All HTTP response headers — responses only |
 | `body_snippet` | string | First 512 bytes of the request or response body (omitted if empty) |
-| `pid` | number | Process ID (populated for SSL-uprobe events; omitted for TC events) |
-| `process_name` | string | Process name (populated for SSL-uprobe events; omitted for TC events) |
+| `pid` | number | Process ID of the owning process — populated for all events; resolved via `/proc/net/tcp` for TC events and directly from the SSL uprobe for TLS events; omitted when not resolvable |
+| `process_name` | string | Process comm name (max 15 chars) — populated for all events alongside `pid`; omitted when not resolvable |
 | `tls_intercepted` | bool | `true` when the payload came from an SSL uprobe (omitted otherwise) |
 
 ---
