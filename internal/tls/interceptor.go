@@ -1,7 +1,6 @@
 package tls
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -128,16 +127,90 @@ func (i *Interceptor) AttachToPID(pid int) error {
 	return i.attachToPID(pid)
 }
 
-// attachToPID finds libssl.so in the PID's memory map and attaches uprobes.
+// attachToPID scans all SSL libraries loaded by pid and attaches scoped uprobes.
+// It handles OpenSSL, dynamic BoringSSL, GnuTLS, NSS/NSPR, and static BoringSSL
+// with ELF symbols — all without requiring per-library configuration.
 func (i *Interceptor) attachToPID(pid int) error {
-	libPath, err := findLibSSL(pid, i.cfg.LibSSLPath)
-	if err != nil {
-		return fmt.Errorf("find libssl for PID %d: %w", pid, err)
+	n := 0
+	for _, lib := range findSSLLibsForPID(pid) {
+		if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid); err != nil {
+			log.Printf("[tls] PID %d %s: %v", pid, filepath.Base(lib.path), err)
+			continue
+		}
+		n++
+	}
+	// Also check the executable itself for static BoringSSL with ELF symbols.
+	if exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err == nil {
+		if wOff, rOff, err := findSSLSymbolOffsets(exePath); err == nil {
+			t := &boringSSlTarget{execPath: exePath, sslWriteOffset: wOff, sslReadOffset: rOff, pid: pid}
+			if err := i.attachBoringSSlProbes(t); err == nil {
+				n++
+			}
+		}
+	}
+	if n == 0 {
+		return fmt.Errorf("no SSL libraries found for PID %d", pid)
+	}
+	return nil
+}
+
+// attachGlobal scans ALL running processes for any known SSL/TLS shared library
+// and attaches system-wide (PID=0) uprobes to each unique library path found.
+// It also checks process executables for statically-linked BoringSSL with ELF symbols.
+// This covers OpenSSL, dynamic BoringSSL, GnuTLS, and NSS/NSPR automatically —
+// no per-library or per-process configuration required.
+func (i *Interceptor) attachGlobal() error {
+	attached := make(map[string]bool)
+
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+
+		// Scan shared libraries loaded by this process.
+		for _, lib := range findSSLLibsForPID(pid) {
+			if attached[lib.path] {
+				continue
+			}
+			if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0); err != nil {
+				log.Printf("[tls] %s: %v", filepath.Base(lib.path), err)
+				continue
+			}
+			attached[lib.path] = true
+		}
+
+		// Check the process executable for statically-linked BoringSSL with symbols.
+		exePath, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil || attached[exePath] {
+			continue
+		}
+		wOff, rOff, err := findSSLSymbolOffsets(exePath)
+		if err == nil {
+			t := &boringSSlTarget{execPath: exePath, sslWriteOffset: wOff, sslReadOffset: rOff}
+			if err := i.attachBoringSSlProbes(t); err == nil {
+				attached[exePath] = true
+			}
+		}
 	}
 
-	ex, err := link.OpenExecutable(libPath)
+	if len(attached) == 0 {
+		log.Printf("[tls] no SSL libraries found in running processes")
+	}
+	return nil
+}
+
+// attachToLib opens path and attaches the four SSL write/read uprobe programs
+// using writeFunc and readFunc as the symbol names.
+// pid=0 attaches system-wide; pid>0 scopes the probes to that process only.
+func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int) error {
+	ex, err := link.OpenExecutable(path)
 	if err != nil {
-		return fmt.Errorf("open executable %s: %w", libPath, err)
+		return fmt.Errorf("open %s: %w", path, err)
 	}
 
 	probes := []struct {
@@ -145,92 +218,36 @@ func (i *Interceptor) attachToPID(pid int) error {
 		prog *ebpf.Program
 		ret  bool
 	}{
-		{"SSL_write", i.objs.UprobeSslWriteEntry, false},
-		{"SSL_write", i.objs.UretprobeSslWriteRet, true},
-		{"SSL_read", i.objs.UprobeSslReadEntry, false},
-		{"SSL_read", i.objs.UretprobeSslReadRet, true},
+		{writeFunc, i.objs.UprobeSslWriteEntry, false},
+		{writeFunc, i.objs.UretprobeSslWriteRet, true},
+		{readFunc, i.objs.UprobeSslReadEntry, false},
+		{readFunc, i.objs.UretprobeSslReadRet, true},
 	}
 
+	var opts *link.UprobeOptions
+	if pid != 0 {
+		opts = &link.UprobeOptions{PID: pid}
+	}
 	for _, p := range probes {
 		var l link.Link
-		var err error
-
-		opts := &link.UprobeOptions{PID: pid}
 		if p.ret {
 			l, err = ex.Uretprobe(p.sym, p.prog, opts)
 		} else {
 			l, err = ex.Uprobe(p.sym, p.prog, opts)
 		}
 		if err != nil {
-			return fmt.Errorf("attach uprobe %s (ret=%v): %w", p.sym, p.ret, err)
+			return fmt.Errorf("uprobe %s: %w", p.sym, err)
 		}
 		i.links = append(i.links, l)
 	}
 
-	log.Printf("[tls] attached SSL uprobes to PID %d (%s)", pid, libPath)
-	return nil
-}
-
-// attachGlobal attaches SSL uprobes system-wide (PID=0) to libssl.so.
-// Used when no specific PIDs or process names are configured.
-func (i *Interceptor) attachGlobal() error {
-	libPath := i.cfg.LibSSLPath
-	if libPath == "" {
-		candidates := []string{
-			"/usr/lib/aarch64-linux-gnu/libssl.so.3",
-			"/usr/lib/x86_64-linux-gnu/libssl.so.3",
-			"/usr/lib/libssl.so.3",
-			"/usr/lib/aarch64-linux-gnu/libssl.so",
-			"/usr/lib/x86_64-linux-gnu/libssl.so",
-		}
-		for _, c := range candidates {
-			if _, err := os.Stat(c); err == nil {
-				libPath = c
-				break
-			}
-		}
+	if pid == 0 {
+		log.Printf("[tls] attached global uprobes to %s (%s/%s)",
+			filepath.Base(path), writeFunc, readFunc)
+	} else {
+		log.Printf("[tls] attached uprobes to PID %d via %s (%s/%s)",
+			pid, filepath.Base(path), writeFunc, readFunc)
 	}
-	if libPath == "" {
-		return fmt.Errorf("libssl.so not found; set tls.libssl_path in config")
-	}
-
-	ex, err := link.OpenExecutable(libPath)
-	if err != nil {
-		return fmt.Errorf("open executable %s: %w", libPath, err)
-	}
-
-	probes := []struct {
-		sym  string
-		prog *ebpf.Program
-		ret  bool
-	}{
-		{"SSL_write", i.objs.UprobeSslWriteEntry, false},
-		{"SSL_write", i.objs.UretprobeSslWriteRet, true},
-		{"SSL_read", i.objs.UprobeSslReadEntry, false},
-		{"SSL_read", i.objs.UretprobeSslReadRet, true},
-	}
-
-	// PID=0 (omitted from opts) means system-wide — intercepts all processes
-	// that call into this libssl.so.
-	for _, p := range probes {
-		var l link.Link
-		var err error
-		if p.ret {
-			l, err = ex.Uretprobe(p.sym, p.prog, nil)
-		} else {
-			l, err = ex.Uprobe(p.sym, p.prog, nil)
-		}
-		if err != nil {
-			return fmt.Errorf("attach global uprobe %s (ret=%v): %w", p.sym, p.ret, err)
-		}
-		i.links = append(i.links, l)
-	}
-
-	log.Printf("[tls] attached global SSL uprobes to %s", libPath)
-
-	// Also scan running processes for dynamically loaded BoringSSL libraries
-	// (e.g. apps that ship their own libboringssl.so).
-	i.scanForDynamicBoringSSL()
 	return nil
 }
 
@@ -354,36 +371,6 @@ func (i *Interceptor) attachBoringSSlProbes(t *boringSSlTarget) error {
 	return nil
 }
 
-// scanForDynamicBoringSSL iterates /proc/*/maps looking for processes that
-// have loaded a BoringSSL shared library and attaches uprobes to each unique
-// library path found. Called automatically in global (no-PID) attach mode.
-func (i *Interceptor) scanForDynamicBoringSSL() {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return
-	}
-	seen := make(map[string]bool)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		libPath := findDynamicBoringSSlLib(pid)
-		if libPath == "" || seen[libPath] {
-			continue
-		}
-		seen[libPath] = true
-		// isDynamic=true: symbol lookup is used, no offsets needed.
-		t := &boringSSlTarget{execPath: libPath, isDynamic: true, pid: 0}
-		if err := i.attachBoringSSlProbes(t); err != nil {
-			log.Printf("[tls] dynamic BoringSSL %s: %v", libPath, err)
-		}
-	}
-}
-
 // readLoop reads SSL events from the ring buffer and forwards them.
 func (i *Interceptor) readLoop(ch chan<- *types.SSLEvent) {
 	for {
@@ -444,35 +431,6 @@ func parseSSLEvent(data []byte) (*types.SSLEvent, error) {
 }
 
 // ---- Process discovery helpers ----
-
-// findLibSSL returns the path to libssl.so for a given PID.
-// If explicitPath is non-empty, it is returned directly.
-func findLibSSL(pid int, explicitPath string) (string, error) {
-	if explicitPath != "" {
-		return explicitPath, nil
-	}
-
-	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
-	f, err := os.Open(mapsPath)
-	if err != nil {
-		return "", fmt.Errorf("open %s: %w", mapsPath, err)
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Each line: address perms offset dev inode pathname
-		// e.g.: 7f1234 r-xp 0000 fd:01 12345 /lib/x86_64-linux-gnu/libssl.so.3
-		if strings.Contains(line, "libssl.so") {
-			fields := strings.Fields(line)
-			if len(fields) >= 6 {
-				return fields[5], nil
-			}
-		}
-	}
-	return "", fmt.Errorf("libssl.so not found in /proc/%d/maps", pid)
-}
 
 // findPIDsByName returns PIDs of all processes whose comm matches any name in names.
 func findPIDsByName(names []string) ([]int, error) {
