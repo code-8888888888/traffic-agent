@@ -139,6 +139,11 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	p.mu.Unlock()
 
 	if !ev.IsRead {
+		// HTTP/2 cleartext connection preface — discard, we can't parse HTTP/2 framing.
+		if bytes.HasPrefix(data, []byte("PRI * HTTP/2.0")) {
+			p.deleteSSLBuf(key)
+			return
+		}
 		// SSL_write: process is sending plaintext → HTTP request (egress).
 		fields, ok := parseHTTPRequestFields(data)
 		if !ok {
