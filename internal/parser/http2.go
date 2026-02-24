@@ -39,6 +39,8 @@ const (
 	h2FrameData         = byte(0x0)
 	h2FrameHeaders      = byte(0x1)
 	h2FrameSettings     = byte(0x4)
+	h2FramePing         = byte(0x6)
+	h2FrameWindowUpdate = byte(0x8)
 	h2FrameContinuation = byte(0x9)
 )
 
@@ -149,6 +151,12 @@ func looksLikeH2MidConnection(data []byte) bool {
 	case h2FrameData: // 0x00
 		// DATA: stream ID must be > 0, and length ≥ 1.
 		return streamID > 0 && frameLen >= 1
+	case h2FramePing: // 0x06
+		// PING: fixed 8-byte payload, always on stream 0.
+		return frameLen == 8 && streamID == 0
+	case h2FrameWindowUpdate: // 0x08
+		// WINDOW_UPDATE: fixed 4-byte payload.
+		return frameLen == 4
 	}
 	return false
 }
@@ -172,6 +180,21 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 		data := ev.Data
 		if isHTTP2Preface(data) {
 			data = data[len(h2ClientPreface):]
+			// New connection on this (PID, TID) — reset all state.
+			// Firefox's Socket Thread handles ALL H2 connections, so
+			// navigating to a new domain sends a new preface on the
+			// same thread.  Stale HPACK tables and activeStreams from
+			// the previous domain must be cleared.
+			state.writeDecoder = hpack.NewDecoder(4096, nil)
+			state.readDecoder = hpack.NewDecoder(4096, nil)
+			state.activeStreams = make(map[uint32]*h2StreamInfo)
+			state.writeBuf = nil
+			state.readBuf = nil
+			state.pendingWriteBlock = nil
+			state.pendingReadBlock = nil
+			state.pendingWriteStream = 0
+			state.pendingReadStream = 0
+			state.consecutiveErrors = 0
 		}
 		if len(data) == 0 {
 			p.mu.Unlock()
@@ -362,18 +385,37 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 	dec.SetEmitEnabled(true)
 	dec.SetEmitFunc(func(f hpack.HeaderField) { fields = append(fields, f) })
 	_, err := dec.Write(block)
+	if err == nil {
+		dec.Close() // Reset firstField flag so dynamic table size updates are accepted.
+	}
 	dec.SetEmitEnabled(false)
 
 	if err != nil {
 		// Dynamic table out of sync (agent missed earlier frames or
-		// garbage data leaked in).  Reset so future frames decode correctly.
-		s.consecutiveErrors++
+		// garbage data leaked in).  Replace the stored decoder with a
+		// fresh one so future frames decode correctly.
 		if isRead {
 			s.readDecoder = hpack.NewDecoder(4096, nil)
 		} else {
 			s.writeDecoder = hpack.NewDecoder(4096, nil)
 		}
-		return
+
+		// Strategy 1: use partial fields already captured by emit callback.
+		// The emit func fires for each header decoded before the error, so
+		// static-table entries like :method, :path are often available.
+
+		// Strategy 2: if no partial fields, retry with a throwaway fresh
+		// decoder.  Static table entries decode without dynamic table state.
+		if len(fields) == 0 {
+			retryDec := hpack.NewDecoder(4096, nil)
+			retryDec.SetEmitFunc(func(f hpack.HeaderField) { fields = append(fields, f) })
+			retryDec.Write(block) // ignore error — we just want static-table entries
+		}
+
+		if len(fields) == 0 {
+			s.consecutiveErrors++
+			return
+		}
 	}
 
 	if isRead {
