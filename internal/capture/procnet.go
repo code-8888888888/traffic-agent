@@ -3,12 +3,8 @@ package capture
 // lookupTCPProcess resolves the PID and process name for a TCP connection by
 // scanning /proc/net/tcp and then /proc/<pid>/fd/.
 //
-// localIP:localPort is the address on this machine (src for egress, dst for
-// ingress). remoteIP:remotePort is the peer address.
-//
-// This is a best-effort, zero-BPF-helper approach that works for any
-// BPF program type. The cost is two /proc reads per event; acceptable for
-// HTTP traffic volumes.
+// LookupTCPProcessCached wraps the raw lookup with a TTL cache so that the
+// expensive /proc scan is amortised across many packets on the same connection.
 
 import (
 	"bufio"
@@ -19,7 +15,100 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
+
+// ---- Process lookup cache ----
+
+// procKey identifies a TCP 4-tuple for caching.
+type procKey struct {
+	srcIP   [4]byte
+	srcPort uint16
+	dstIP   [4]byte
+	dstPort uint16
+}
+
+// procEntry is a cached process lookup result.
+type procEntry struct {
+	pid       uint32
+	comm      string
+	timestamp time.Time
+}
+
+const procCacheTTL = 30 * time.Second
+
+// procCache is a concurrent-safe TTL cache for process lookups.
+type procCache struct {
+	mu      sync.RWMutex
+	entries map[procKey]procEntry
+}
+
+var globalProcCache = &procCache{
+	entries: make(map[procKey]procEntry),
+}
+
+func makeProcKey(srcIP, dstIP net.IP, srcPort, dstPort uint16) procKey {
+	var k procKey
+	copy(k.srcIP[:], srcIP.To4())
+	copy(k.dstIP[:], dstIP.To4())
+	k.srcPort = srcPort
+	k.dstPort = dstPort
+	return k
+}
+
+// LookupTCPProcessCached resolves PID/comm for a packet, using a TTL cache
+// to avoid repeated /proc scans. Safe to call from multiple goroutines.
+func LookupTCPProcessCached(srcIP, dstIP net.IP, srcPort, dstPort uint16, direction uint8) (uint32, string) {
+	// For egress: local=src; for ingress: local=dst.
+	var localIP, remoteIP net.IP
+	var localPort, remotePort uint16
+	if direction == 1 { // DIR_EGRESS
+		localIP, localPort = srcIP, srcPort
+		remoteIP, remotePort = dstIP, dstPort
+	} else {
+		localIP, localPort = dstIP, dstPort
+		remoteIP, remotePort = srcIP, srcPort
+	}
+
+	key := makeProcKey(srcIP, dstIP, srcPort, dstPort)
+
+	// Check cache (read lock).
+	globalProcCache.mu.RLock()
+	if entry, ok := globalProcCache.entries[key]; ok && time.Since(entry.timestamp) < procCacheTTL {
+		globalProcCache.mu.RUnlock()
+		return entry.pid, entry.comm
+	}
+	globalProcCache.mu.RUnlock()
+
+	// Cache miss — do the expensive /proc scan.
+	pid, comm := lookupTCPProcess(localIP, localPort, remoteIP, remotePort)
+
+	// Store result (even zero/empty — avoids repeated scans for unknown connections).
+	globalProcCache.mu.Lock()
+	globalProcCache.entries[key] = procEntry{
+		pid:       pid,
+		comm:      comm,
+		timestamp: time.Now(),
+	}
+	globalProcCache.mu.Unlock()
+
+	return pid, comm
+}
+
+// PurgeProcCache removes expired entries. Call periodically from a maintenance goroutine.
+func PurgeProcCache() {
+	now := time.Now()
+	globalProcCache.mu.Lock()
+	for k, v := range globalProcCache.entries {
+		if now.Sub(v.timestamp) > procCacheTTL {
+			delete(globalProcCache.entries, k)
+		}
+	}
+	globalProcCache.mu.Unlock()
+}
+
+// ---- Raw /proc lookups (unchanged) ----
 
 // lookupTCPProcess finds the PID and comm for a TCP 4-tuple.
 // Returns (0, "") when no match is found.

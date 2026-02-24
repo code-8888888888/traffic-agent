@@ -20,11 +20,12 @@ char __license[] SEC("license") = "GPL";
 
 /**
  * events - Ring buffer for sending packet events to userspace.
- * Size: 256 KiB (must be a power of two multiple of PAGE_SIZE).
+ * Size: 8 MiB — holds ~4000 packet_event structs (~2076 bytes each).
+ * Must be a power of two multiple of PAGE_SIZE.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 256 * 1024);
+    __uint(max_entries, 8 * 1024 * 1024);
 } events SEC(".maps");
 
 /**

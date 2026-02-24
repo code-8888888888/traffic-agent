@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
@@ -18,6 +19,15 @@ import (
 	"github.com/traffic-agent/traffic-agent/internal/config"
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
+
+// TCDropCount tracks how many TC events were dropped because the Go channel
+// was full. Read and reset via TCDropCountReset().
+var tcDropCount atomic.Uint64
+
+// TCDropCountReset returns the current drop count and resets it to zero.
+func TCDropCountReset() uint64 {
+	return tcDropCount.Swap(0)
+}
 
 // PacketEventSize is the fixed size of the C struct packet_event.
 // Must match sizeof(struct packet_event) in bpf/tc_capture.c.
@@ -146,6 +156,7 @@ func (c *Capturer) UpdateFilter(srcIP, dstIP net.IP, srcPort, dstPort uint16) er
 }
 
 // readLoop reads events from the BPF ring buffer and forwards them to ch.
+// This goroutine must remain fast — no /proc I/O or other blocking calls.
 func (c *Capturer) readLoop(ch chan<- *types.RawPacketEvent) {
 	for {
 		record, err := c.reader.Read()
@@ -166,8 +177,8 @@ func (c *Capturer) readLoop(ch chan<- *types.RawPacketEvent) {
 		select {
 		case ch <- ev:
 		default:
-			// Drop event if consumer is too slow; avoid blocking the reader.
-			log.Printf("[capture] dropping event: channel full")
+			// Drop event if consumer is too slow; counted via atomic.
+			tcDropCount.Add(1)
 		}
 	}
 }
@@ -200,16 +211,9 @@ func parsePacketEvent(data []byte) (*types.RawPacketEvent, error) {
 	srcIP := uint32ToIP(raw.SrcIP)
 	dstIP := uint32ToIP(raw.DstIP)
 
-	// Best-effort PID/comm lookup from /proc/net/tcp.
-	// For egress: we are the sender, so local=src. For ingress: local=dst.
-	var pid uint32
-	var comm string
-	if raw.Direction == 1 { // DIR_EGRESS
-		pid, comm = lookupTCPProcess(srcIP, raw.SrcPort, dstIP, raw.DstPort)
-	} else {
-		pid, comm = lookupTCPProcess(dstIP, raw.DstPort, srcIP, raw.SrcPort)
-	}
-
+	// PID/comm are NOT resolved here — this runs on the hot ring buffer
+	// reader goroutine. The consumer goroutine fills them in via
+	// LookupTCPProcessCached() to avoid blocking the reader.
 	return &types.RawPacketEvent{
 		TimestampNS: raw.TimestampNS,
 		SrcIP:       srcIP,
@@ -218,8 +222,8 @@ func parsePacketEvent(data []byte) (*types.RawPacketEvent, error) {
 		DstPort:     raw.DstPort,
 		Direction:   types.Direction(raw.Direction),
 		Protocol:    raw.Protocol,
-		PID:         pid,
-		ProcessName: comm,
+		PID:         0,
+		ProcessName: "",
 		Payload:     append([]byte(nil), data[28:payloadEnd]...),
 	}, nil
 }

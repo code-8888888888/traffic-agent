@@ -81,7 +81,7 @@ func main() {
 	p := parser.New(sink)
 
 	// ---- Start TC packet capture ----
-	rawPacketCh := make(chan *types.RawPacketEvent, 512)
+	rawPacketCh := make(chan *types.RawPacketEvent, 4096)
 
 	cap, err := capture.New(cfg)
 	if err != nil {
@@ -92,21 +92,34 @@ func main() {
 	}
 	defer cap.Stop()
 
-	// Feed raw packets into the HTTP parser.
-	go func() {
-		for ev := range rawPacketCh {
-			if f.AllowRaw(ev) {
+	// Feed raw packets into the HTTP parser via 2 worker goroutines.
+	// Process lookup (LookupTCPProcessCached) runs here, off the ring buffer
+	// reader hot path, so a slow /proc scan on one worker doesn't block the
+	// other worker or the ring buffer reader.
+	const tcWorkers = 2
+	for i := 0; i < tcWorkers; i++ {
+		go func() {
+			for ev := range rawPacketCh {
+				if !f.AllowRaw(ev) {
+					continue
+				}
+				// Fill in PID/comm from cached /proc lookup.
+				pid, comm := capture.LookupTCPProcessCached(
+					ev.SrcIP, ev.DstIP, ev.SrcPort, ev.DstPort, uint8(ev.Direction))
+				ev.PID = pid
+				ev.ProcessName = comm
 				p.HandlePacket(ev)
 			}
-		}
-	}()
+		}()
+	}
 
-	// Periodically flush stale TCP streams.
+	// Periodically flush stale TCP streams and purge proc cache.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			p.FlushExpired(60 * time.Second)
+			capture.PurgeProcCache()
 		}
 	}()
 
@@ -140,6 +153,19 @@ func main() {
 			}
 		}()
 	}
+
+	// Periodic TC capture stats (drop counter).
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			drops := capture.TCDropCountReset()
+			if drops > 0 {
+				log.Printf("[stats] TC packet drops (channel full): %d in last 5s, chan_len=%d",
+					drops, len(rawPacketCh))
+			}
+		}
+	}()
 
 	// ---- Wait for shutdown signal ----
 	ctx, stop := signal.NotifyContext(context.Background(),
