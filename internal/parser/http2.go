@@ -54,12 +54,14 @@ const (
 // h2FrameHeaderLen is the fixed 9-byte length of every HTTP/2 frame header.
 const h2FrameHeaderLen = 9
 
-// h2ConnKey identifies an HTTP/2 connection by the PID and TID of the thread
-// that called SSL_write / SSL_read.  Each TLS stream is owned by exactly one
-// thread in the browser process.
+// h2ConnKey identifies an HTTP/2 connection by the PID, TID, and ConnID
+// (the SSL*/PRFileDesc* pointer captured by the BPF uprobe).  ConnID
+// disambiguates multiple connections multiplexed on the same thread (e.g.
+// Firefox's Socket Thread handles ALL H2 connections).
 type h2ConnKey struct {
-	PID uint32
-	TID uint32
+	PID    uint32
+	TID    uint32
+	ConnID uint64
 }
 
 // h2StreamInfo tracks a request's metadata for correlating DATA frames.
@@ -237,7 +239,7 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 	// If too many consecutive errors, the state is corrupt.
 	// Delete it so a fresh preface can re-create a clean state.
 	if state.consecutiveErrors >= maxH2ConsecutiveErrors {
-		h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID}
+		h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
 		delete(p.h2Conns, h2Key)
 	}
 
@@ -444,14 +446,16 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 			}
 		}
 	}
-	if method == "" || path == "" {
-		return // trailers or PUSH_PROMISE — skip
+	if method == "" {
+		return // trailers — skip
 	}
 	if host != "" {
 		headers["Host"] = host
 	}
 
 	// Track request metadata for DATA frame correlation.
+	// Populate activeStreams even if path is empty (mid-connection join with
+	// stale HPACK table) so DATA frames get annotated with at least the method.
 	if s.activeStreams == nil {
 		s.activeStreams = make(map[uint32]*h2StreamInfo)
 	}

@@ -54,10 +54,13 @@ type flowKey struct {
 	dstPort uint16
 }
 
-// sslFlowKey identifies a per-thread SSL data stream.
+// sslFlowKey identifies a per-connection SSL data stream.
+// ConnID (SSL*/PRFileDesc* pointer) disambiguates multiple connections
+// multiplexed on the same thread (e.g. Firefox's Socket Thread).
 type sslFlowKey struct {
 	PID    uint32
 	TID    uint32
+	ConnID uint64
 	IsRead bool
 }
 
@@ -143,7 +146,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	}
 	sslEventsReceived.Add(1)
 
-	h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID}
+	h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
 
 	// Check whether this (PID, TID) is already tracked as an HTTP/2 connection.
 	p.mu.Lock()
@@ -158,7 +161,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		p.h2Conns[h2Key] = h2State
 		p.mu.Unlock()
 		sslEventsH2Preface.Add(1)
-		log.Printf("[parser] HTTP/2 preface detected PID=%d TID=%d proc=%s", ev.PID, ev.TID, ev.ProcessName)
+		log.Printf("[parser] HTTP/2 preface detected PID=%d TID=%d conn=0x%x proc=%s", ev.PID, ev.TID, ev.ConnID, ev.ProcessName)
 	}
 
 	// Mid-connection HTTP/2 detection: if no h2ConnState exists yet, check
@@ -175,8 +178,8 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		p.h2Conns[h2Key] = h2State
 		p.mu.Unlock()
 		sslEventsH2Preface.Add(1)
-		log.Printf("[parser] HTTP/2 mid-connection join PID=%d TID=%d proc=%s (frame type=0x%02x)",
-			ev.PID, ev.TID, ev.ProcessName, ev.Data[3])
+		log.Printf("[parser] HTTP/2 mid-connection join PID=%d TID=%d conn=0x%x proc=%s (frame type=0x%02x)",
+			ev.PID, ev.TID, ev.ConnID, ev.ProcessName, ev.Data[3])
 	}
 
 	if h2State != nil {
@@ -207,7 +210,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	// could plausibly be HTTP. NSPR's PR_Write fires for ALL I/O (IPC, files,
 	// TLS), and accumulating non-HTTP data wastes memory (up to 256KB per
 	// flow) and CPU (re-parse attempt on every new event).
-	key := sslFlowKey{PID: ev.PID, TID: ev.TID, IsRead: ev.IsRead}
+	key := sslFlowKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID, IsRead: ev.IsRead}
 
 	p.mu.Lock()
 	fb := p.sslBufs[key]

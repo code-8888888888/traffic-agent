@@ -43,6 +43,7 @@ type RawPacketEvent struct {
 // It is produced by the tls package and consumed by the parser package.
 type SSLEvent struct {
 	TimestampNS uint64
+	ConnID      uint64 // SSL*/PRFileDesc* pointer — opaque per-connection key
 	PID         uint32
 	TID         uint32
 	UID         uint32

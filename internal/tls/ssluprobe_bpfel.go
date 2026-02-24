@@ -13,9 +13,10 @@ import (
 )
 
 type SSLUprobeSslArgs struct {
-	Buf uint64
-	Num uint32
-	Pad uint32
+	Buf    uint64
+	ConnId uint64
+	Num    uint32
+	Pad    uint32
 }
 
 // LoadSSLUprobe returns the embedded CollectionSpec for SSLUprobe.

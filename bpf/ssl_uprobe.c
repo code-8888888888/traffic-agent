@@ -44,8 +44,9 @@ struct {
  * Keyed by thread ID (lower 32 bits of pid_tgid).
  */
 struct ssl_args {
-    __u64 buf;   /* pointer to plaintext buffer (user address) */
-    __u32 num;   /* requested length */
+    __u64 buf;       /* pointer to plaintext buffer (user address) */
+    __u64 conn_id;   /* SSL/PRFileDesc pointer — opaque per-connection key */
+    __u32 num;       /* requested length */
     __u32 _pad;
 };
 
@@ -69,6 +70,7 @@ struct {
 
 struct ssl_event {
     __u64 timestamp_ns;
+    __u64 conn_id;              /* SSL/PRFileDesc pointer — opaque per-connection key */
     __u32 pid;
     __u32 tid;
     __u32 uid;
@@ -96,6 +98,7 @@ int uprobe_ssl_write_entry(struct pt_regs *ctx)
 
     struct ssl_args args = {
         .buf = PT_REGS_PARM2(ctx),
+        .conn_id = PT_REGS_PARM1(ctx),
         .num = (__u32)PT_REGS_PARM3(ctx),
     };
     bpf_map_update_elem(&active_ssl_write_args, &tid, &args, BPF_ANY);
@@ -120,6 +123,7 @@ int uretprobe_ssl_write_ret(struct pt_regs *ctx)
         goto cleanup;
 
     ev->timestamp_ns = bpf_ktime_get_ns();
+    ev->conn_id      = args->conn_id;
     ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
     ev->tid          = tid;
     ev->uid          = (__u32)bpf_get_current_uid_gid();
@@ -163,6 +167,7 @@ int uprobe_ssl_read_entry(struct pt_regs *ctx)
 
     struct ssl_args args = {
         .buf = PT_REGS_PARM2(ctx),
+        .conn_id = PT_REGS_PARM1(ctx),
         .num = (__u32)PT_REGS_PARM3(ctx),
     };
     bpf_map_update_elem(&active_ssl_read_args, &tid, &args, BPF_ANY);
@@ -187,6 +192,7 @@ int uretprobe_ssl_read_ret(struct pt_regs *ctx)
         goto cleanup;
 
     ev->timestamp_ns = bpf_ktime_get_ns();
+    ev->conn_id      = args->conn_id;
     ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
     ev->tid          = tid;
     ev->uid          = (__u32)bpf_get_current_uid_gid();
@@ -248,6 +254,7 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
         return 0;
 
     ev->timestamp_ns = bpf_ktime_get_ns();
+    ev->conn_id      = PT_REGS_PARM1(ctx);
     ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
     ev->tid          = (__u32)bpf_get_current_pid_tgid();
     ev->uid          = (__u32)bpf_get_current_uid_gid();

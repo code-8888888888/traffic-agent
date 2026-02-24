@@ -36,6 +36,7 @@ const maxSSLDataSize = 16384
 // rawSSLEvent mirrors struct ssl_event from bpf/ssl_uprobe.c.
 type rawSSLEvent struct {
 	TimestampNS uint64
+	ConnID      uint64
 	PID         uint32
 	TID         uint32
 	UID         uint32
@@ -580,22 +581,25 @@ func (i *Interceptor) readLoop(ch chan<- *types.SSLEvent) {
 }
 
 func parseSSLEvent(data []byte) (*types.SSLEvent, error) {
-	// The fixed header is 44 bytes (before the variable-length data field).
-	const headerSize = 44
+	// The fixed header is 52 bytes (before the variable-length data field).
+	// Layout: timestamp_ns(8) + conn_id(8) + pid(4) + tid(4) + uid(4) +
+	//         is_read(1) + pad(3) + data_len(4) + comm(16) = 52
+	const headerSize = 52
 	if len(data) < headerSize {
 		return nil, fmt.Errorf("short SSL record: %d bytes", len(data))
 	}
 
 	var raw rawSSLEvent
 	raw.TimestampNS = binary.LittleEndian.Uint64(data[0:8])
-	raw.PID = binary.LittleEndian.Uint32(data[8:12])
-	raw.TID = binary.LittleEndian.Uint32(data[12:16])
-	raw.UID = binary.LittleEndian.Uint32(data[16:20])
-	raw.IsRead = data[20]
-	raw.DataLen = binary.LittleEndian.Uint32(data[24:28])
-	copy(raw.Comm[:], data[28:44])
+	raw.ConnID = binary.LittleEndian.Uint64(data[8:16])
+	raw.PID = binary.LittleEndian.Uint32(data[16:20])
+	raw.TID = binary.LittleEndian.Uint32(data[20:24])
+	raw.UID = binary.LittleEndian.Uint32(data[24:28])
+	raw.IsRead = data[28]
+	raw.DataLen = binary.LittleEndian.Uint32(data[32:36])
+	copy(raw.Comm[:], data[36:52])
 
-	dataStart := 44
+	dataStart := 52
 	dataEnd := dataStart + int(raw.DataLen)
 	if dataEnd > len(data) {
 		dataEnd = len(data)
@@ -604,6 +608,7 @@ func parseSSLEvent(data []byte) (*types.SSLEvent, error) {
 	comm := strings.TrimRight(string(raw.Comm[:]), "\x00")
 	return &types.SSLEvent{
 		TimestampNS: raw.TimestampNS,
+		ConnID:      raw.ConnID,
 		PID:         raw.PID,
 		TID:         raw.TID,
 		UID:         raw.UID,
