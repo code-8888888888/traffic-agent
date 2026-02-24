@@ -494,6 +494,12 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		snippet = snippet[:types.BodySnippetMaxLen]
 	}
 
+	// Full request body (up to RequestBodyMaxLen).
+	reqBody := body
+	if len(reqBody) > types.RequestBodyMaxLen {
+		reqBody = reqBody[:types.RequestBodyMaxLen]
+	}
+
 	if !isRead {
 		// Egress DATA: look up the request's HEADERS metadata.
 		info := s.activeStreams[streamID]
@@ -504,6 +510,7 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 			PID:            pid,
 			ProcessName:    comm,
 			BodySnippet:    string(snippet),
+			RequestBody:    string(reqBody),
 			TLSIntercepted: true,
 		}
 		if info != nil {

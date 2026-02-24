@@ -78,8 +78,12 @@ type TrafficEvent struct {
 	// Payload snippet (first 512 bytes of the HTTP body or raw payload)
 	BodySnippet string `json:"body_snippet,omitempty"`
 
+	// RequestBody holds the full POST/PUT/PATCH request body (up to 4096 bytes).
+	RequestBody string `json:"request_body,omitempty"`
+
 	// TLSIntercepted indicates the payload came from an SSL uprobe (plaintext).
 	TLSIntercepted bool `json:"tls_intercepted,omitempty"`
 }
 
 const BodySnippetMaxLen = 512
+const RequestBodyMaxLen = 4096

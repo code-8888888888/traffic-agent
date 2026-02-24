@@ -245,6 +245,7 @@ func (p *Parser) tryParseSSLData(data []byte, ev *types.SSLEvent) *types.Traffic
 			URL:            fields.url,
 			RequestHeaders: fields.headers,
 			BodySnippet:    fields.body,
+			RequestBody:    fields.requestBody,
 			TLSIntercepted: true,
 		}
 	}
@@ -316,6 +317,7 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 		URL:            fields.url,
 		RequestHeaders: fields.headers,
 		BodySnippet:    fields.body,
+		RequestBody:    fields.requestBody,
 	}
 	p.sink(te)
 	p.mu.Lock()
@@ -369,10 +371,11 @@ func (p *Parser) deleteSSLBuf(key sslFlowKey) {
 // ---- Shared HTTP parsing helpers ----
 
 type httpRequestFields struct {
-	method  string
-	url     string
-	headers map[string]string
-	body    string
+	method      string
+	url         string
+	headers     map[string]string
+	body        string
+	requestBody string // full request body up to RequestBodyMaxLen
 }
 
 type httpResponseFields struct {
@@ -395,7 +398,7 @@ func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	}
 	defer req.Body.Close()
 
-	bodyBuf := make([]byte, types.BodySnippetMaxLen)
+	bodyBuf := make([]byte, types.RequestBodyMaxLen)
 	bodyN, _ := io.ReadAtLeast(req.Body, bodyBuf, 1)
 	if bodyN < 0 {
 		bodyN = 0
@@ -416,15 +419,22 @@ func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	}
 
 	body := ""
+	requestBody := ""
 	if bodyN > 0 {
-		body = string(bodyBuf[:bodyN])
+		requestBody = string(bodyBuf[:bodyN])
+		snippetN := bodyN
+		if snippetN > types.BodySnippetMaxLen {
+			snippetN = types.BodySnippetMaxLen
+		}
+		body = string(bodyBuf[:snippetN])
 	}
 
 	return &httpRequestFields{
-		method:  req.Method,
-		url:     req.URL.String(),
-		headers: headers,
-		body:    body,
+		method:      req.Method,
+		url:         req.URL.String(),
+		headers:     headers,
+		body:        body,
+		requestBody: requestBody,
 	}, true
 }
 
@@ -462,10 +472,23 @@ func parseRequestLineFallback(data []byte) (*httpRequestFields, bool) {
 		}
 	}
 
+	// Extract request body after the \r\n\r\n header terminator.
+	var requestBody string
+	if sep := bytes.Index(data, []byte("\r\n\r\n")); sep >= 0 {
+		bodyData := data[sep+4:]
+		if len(bodyData) > types.RequestBodyMaxLen {
+			bodyData = bodyData[:types.RequestBodyMaxLen]
+		}
+		if len(bodyData) > 0 {
+			requestBody = string(bodyData)
+		}
+	}
+
 	return &httpRequestFields{
-		method:  method,
-		url:     url,
-		headers: headers,
+		method:      method,
+		url:         url,
+		headers:     headers,
+		requestBody: requestBody,
 	}, true
 }
 
