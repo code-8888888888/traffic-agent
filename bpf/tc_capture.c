@@ -138,11 +138,23 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     /* --- Apply filter config --- */
     __u32 zero = 0;
     struct filter_config *cfg = bpf_map_lookup_elem(&filter_config_map, &zero);
-    if (cfg && cfg->flags != 0) {
-        if (cfg->src_ip   && cfg->src_ip   != ip->saddr)  return TC_ACT_OK;
-        if (cfg->dst_ip   && cfg->dst_ip   != ip->daddr)  return TC_ACT_OK;
-        if (cfg->src_port && cfg->src_port != src_port)    return TC_ACT_OK;
-        if (cfg->dst_port && cfg->dst_port != dst_port)    return TC_ACT_OK;
+    if (cfg) {
+        /* Bit 1 (0x2): skip TLS-encrypted ports.  When SSL uprobes are
+         * active, port 443/8443 payloads are ciphertext — useless for the
+         * parser, and the plaintext is already captured by the SSL path.
+         * Skipping here avoids ring buffer and CPU waste. */
+        if ((cfg->flags & 0x2) &&
+            (dst_port == 443 || src_port == 443 ||
+             dst_port == 8443 || src_port == 8443))
+            return TC_ACT_OK;
+
+        /* Bit 0 (0x1): IP/port inclusion filter. */
+        if (cfg->flags & 0x1) {
+            if (cfg->src_ip   && cfg->src_ip   != ip->saddr)  return TC_ACT_OK;
+            if (cfg->dst_ip   && cfg->dst_ip   != ip->daddr)  return TC_ACT_OK;
+            if (cfg->src_port && cfg->src_port != src_port)    return TC_ACT_OK;
+            if (cfg->dst_port && cfg->dst_port != dst_port)    return TC_ACT_OK;
+        }
     }
 
     /* --- Allocate ring buffer slot --- */

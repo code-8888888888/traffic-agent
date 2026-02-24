@@ -133,6 +133,14 @@ func main() {
 		} else {
 			defer interceptor.Stop()
 
+			// Tell the TC BPF program to skip port 443/8443 — those payloads
+			// are ciphertext and the SSL uprobes capture the plaintext.
+			if err := cap.SetSkipTLS(true); err != nil {
+				log.Printf("[main] SetSkipTLS: %v", err)
+			} else {
+				log.Println("[main] TC filter: skipping TLS ports (443/8443) — SSL uprobes active")
+			}
+
 			go func() {
 				for sslEv := range sslEventCh {
 					p.HandleSSLEvent(sslEv)
@@ -146,9 +154,10 @@ func main() {
 			defer ticker.Stop()
 			for range ticker.C {
 				rx, h2p, h2r, h1, skip := parser.SSLEventStats()
-				if rx > 0 {
-					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d chan_len=%d",
-						rx, h2p, h2r, h1, skip, len(sslEventCh))
+				sslDrops := tls.SSLDropCountReset()
+				if rx > 0 || sslDrops > 0 {
+					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d chan_len=%d",
+						rx, h2p, h2r, h1, skip, sslDrops, len(sslEventCh))
 				}
 			}
 		}()

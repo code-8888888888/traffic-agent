@@ -203,15 +203,29 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		return
 	}
 
-	// Single-event parse failed — accumulate and retry.
+	// Single-event parse failed — accumulate and retry, but only if the data
+	// could plausibly be HTTP. NSPR's PR_Write fires for ALL I/O (IPC, files,
+	// TLS), and accumulating non-HTTP data wastes memory (up to 256KB per
+	// flow) and CPU (re-parse attempt on every new event).
 	key := sslFlowKey{PID: ev.PID, TID: ev.TID, IsRead: ev.IsRead}
 
 	p.mu.Lock()
-	fb, ok := p.sslBufs[key]
-	if !ok {
+	fb := p.sslBufs[key]
+	p.mu.Unlock()
+
+	if fb == nil {
+		// New flow — only start accumulating if the data looks like HTTP.
+		if !looksLikeHTTPStart(ev.Data, ev.IsRead) {
+			sslEventsSkipped.Add(1)
+			return
+		}
+		p.mu.Lock()
 		fb = &flowBuf{}
 		p.sslBufs[key] = fb
+		p.mu.Unlock()
 	}
+
+	p.mu.Lock()
 	if len(fb.data)+len(ev.Data) <= maxFlowBufSize {
 		fb.data = append(fb.data, ev.Data...)
 	}
@@ -601,6 +615,33 @@ func isClientPort(dstPort uint16) bool {
 
 func isServerPort(srcPort uint16) bool {
 	return srcPort == 80 || srcPort == 443 || srcPort == 8080 || srcPort == 8443
+}
+
+// looksLikeHTTPStart returns true if data could be the beginning of an HTTP
+// message. For write (request) data: checks for HTTP method prefix.
+// For read (response) data: checks for "HTTP/" prefix.
+// This filters out non-HTTP data (IPC, file I/O) from NSPR PR_Write noise.
+func looksLikeHTTPStart(data []byte, isRead bool) bool {
+	if len(data) < 4 {
+		return false
+	}
+	if isRead {
+		return bytes.HasPrefix(data, []byte("HTTP/"))
+	}
+	// Check for standard HTTP method prefixes.
+	switch {
+	case bytes.HasPrefix(data, []byte("GET ")),
+		bytes.HasPrefix(data, []byte("POST")),
+		bytes.HasPrefix(data, []byte("PUT ")),
+		bytes.HasPrefix(data, []byte("DELE")),
+		bytes.HasPrefix(data, []byte("PATC")),
+		bytes.HasPrefix(data, []byte("HEAD")),
+		bytes.HasPrefix(data, []byte("OPTI")),
+		bytes.HasPrefix(data, []byte("CONN")),
+		bytes.HasPrefix(data, []byte("TRAC")):
+		return true
+	}
+	return false
 }
 
 func headersToMap(h http.Header) map[string]string {

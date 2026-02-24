@@ -129,15 +129,23 @@ func (c *Capturer) Stop() error {
 	return nil
 }
 
+// BPF filter_config flags.
+const (
+	filterFlagEnabled = 0x1 // enable IP/port inclusion filter
+	filterFlagSkipTLS = 0x2 // skip port 443/8443 (ciphertext; SSL uprobes capture plaintext)
+)
+
+// filterConfig mirrors struct filter_config in bpf/tc_capture.c.
+type filterConfig struct {
+	SrcIP   uint32
+	DstIP   uint32
+	SrcPort uint16
+	DstPort uint16
+	Flags   uint32
+}
+
 // UpdateFilter writes updated BPF filter config to the filter_config_map.
 func (c *Capturer) UpdateFilter(srcIP, dstIP net.IP, srcPort, dstPort uint16) error {
-	type filterConfig struct {
-		SrcIP    uint32
-		DstIP    uint32
-		SrcPort  uint16
-		DstPort  uint16
-		Flags    uint32
-	}
 	var cfg filterConfig
 	if srcIP != nil {
 		cfg.SrcIP = ipToUint32(srcIP)
@@ -148,10 +156,25 @@ func (c *Capturer) UpdateFilter(srcIP, dstIP net.IP, srcPort, dstPort uint16) er
 	cfg.SrcPort = srcPort
 	cfg.DstPort = dstPort
 	if cfg.SrcIP != 0 || cfg.DstIP != 0 || cfg.SrcPort != 0 || cfg.DstPort != 0 {
-		cfg.Flags = 1 // enable filter
+		cfg.Flags = filterFlagEnabled
 	}
 
 	key := uint32(0)
+	return c.objs.FilterConfigMap.Put(key, cfg)
+}
+
+// SetSkipTLS tells the BPF program to skip packets on TLS ports (443, 8443).
+// When SSL uprobes capture plaintext, TC-captured ciphertext is useless.
+func (c *Capturer) SetSkipTLS(skip bool) error {
+	key := uint32(0)
+	var cfg filterConfig
+	// Read existing config to preserve IP/port filter settings.
+	_ = c.objs.FilterConfigMap.Lookup(key, &cfg)
+	if skip {
+		cfg.Flags |= filterFlagSkipTLS
+	} else {
+		cfg.Flags &^= filterFlagSkipTLS
+	}
 	return c.objs.FilterConfigMap.Put(key, cfg)
 }
 
