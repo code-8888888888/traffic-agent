@@ -28,13 +28,13 @@ char __license[] SEC("license") = "GPL";
 
 /**
  * ssl_events - Ring buffer for plaintext SSL data sent to userspace.
- * 16 MiB: NSPR's PR_Write fires for ALL I/O (IPC, files, TLS), so
- * browsers generate many events per second.  With MAX_SSL_DATA_SIZE=4096
- * each event is ~4 KiB, giving room for ~4000 events.
+ * 64 MiB: NSPR's PR_Write fires for ALL I/O (IPC, files, TLS), so
+ * browsers generate many events per second.  With MAX_SSL_DATA_SIZE=16384
+ * each event is ~16 KiB, giving room for ~4000 events.
  */
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 16 * 1024 * 1024);
+    __uint(max_entries, 64 * 1024 * 1024);
 } ssl_events SEC(".maps");
 
 /**

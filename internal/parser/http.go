@@ -398,11 +398,8 @@ func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	}
 	defer req.Body.Close()
 
-	bodyBuf := make([]byte, types.RequestBodyMaxLen)
-	bodyN, _ := io.ReadAtLeast(req.Body, bodyBuf, 1)
-	if bodyN < 0 {
-		bodyN = 0
-	}
+	allBody, _ := io.ReadAll(io.LimitReader(req.Body, int64(types.RequestBodyMaxLen)))
+	bodyN := len(allBody)
 
 	// If Content-Length is known and we haven't received all of it (and
 	// haven't yet filled the snippet buffer), wait for the next segment.
@@ -421,12 +418,12 @@ func parseHTTPRequestFields(data []byte) (*httpRequestFields, bool) {
 	body := ""
 	requestBody := ""
 	if bodyN > 0 {
-		requestBody = string(bodyBuf[:bodyN])
+		requestBody = string(allBody)
 		snippetN := bodyN
 		if snippetN > types.BodySnippetMaxLen {
 			snippetN = types.BodySnippetMaxLen
 		}
-		body = string(bodyBuf[:snippetN])
+		body = string(allBody[:snippetN])
 	}
 
 	return &httpRequestFields{
@@ -512,11 +509,8 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 	}
 	defer resp.Body.Close()
 
-	bodyBuf := make([]byte, types.BodySnippetMaxLen)
-	bodyN, _ := io.ReadAtLeast(resp.Body, bodyBuf, 1)
-	if bodyN < 0 {
-		bodyN = 0
-	}
+	allBody, _ := io.ReadAll(io.LimitReader(resp.Body, int64(types.BodySnippetMaxLen)))
+	bodyN := len(allBody)
 
 	// If Content-Length is known and we haven't received all of it (and
 	// haven't yet filled the snippet buffer), wait for the next segment.
@@ -529,11 +523,10 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 
 	body := ""
 	if bodyN > 0 {
-		rawBody := bodyBuf[:bodyN]
 		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			body = decompressGzip(rawBody)
+			body = decompressGzip(allBody)
 		} else {
-			body = string(rawBody)
+			body = string(allBody)
 		}
 	}
 

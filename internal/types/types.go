@@ -86,4 +86,4 @@ type TrafficEvent struct {
 }
 
 const BodySnippetMaxLen = 512
-const RequestBodyMaxLen = 4096
+const RequestBodyMaxLen = 16384

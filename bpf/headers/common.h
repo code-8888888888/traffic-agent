@@ -31,11 +31,11 @@
 #define MAX_PAYLOAD_SIZE 2048
 /* MAX_SSL_DATA_SIZE: bytes copied per SSL_write/SSL_read uretprobe call.
  * Must be large enough to capture a complete HTTP/1.1 request header block
- * (method, URL, Host, User-Agent, Cookie, etc.).  Firefox sends 600-2000
- * byte requests depending on cookies; 4096 captures the vast majority.
- * bpf_probe_read_user runs in the application's thread context, but 4 KiB
- * copies are still under 1 µs on modern ARM64 cores. */
-#define MAX_SSL_DATA_SIZE 4096
+ * plus POST body in a single SSL_write.  16 KiB matches the default HTTP/2
+ * SETTINGS_MAX_FRAME_SIZE and captures most POST payloads in full.
+ * bpf_probe_read_user runs in the application's thread context; 16 KiB
+ * copies are still under 5 µs on modern ARM64 cores. */
+#define MAX_SSL_DATA_SIZE 16384
 #define TASK_COMM_LEN 16
 
 /* Direction flags */

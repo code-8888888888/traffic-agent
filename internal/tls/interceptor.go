@@ -22,7 +22,7 @@ import (
 )
 
 // maxSSLDataSize must match MAX_SSL_DATA_SIZE in bpf/headers/common.h.
-const maxSSLDataSize = 4096
+const maxSSLDataSize = 16384
 
 // rawSSLEvent mirrors struct ssl_event from bpf/ssl_uprobe.c.
 type rawSSLEvent struct {
