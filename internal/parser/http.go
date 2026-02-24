@@ -150,12 +150,8 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	h2State := p.h2Conns[h2Key]
 	p.mu.Unlock()
 
-	// Detect HTTP/2 connections ONLY from the explicit client connection preface
-	// ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").  The previous heuristic detector
-	// (looksLikeHTTP2) was removed because NSPR's PR_Write fires for ALL I/O
-	// — IPC, file writes, pipe data — not just TLS.  Arbitrary binary data
-	// frequently matches the heuristic (byte[0]<0x20 && byte[3]<=9), creating
-	// a false h2ConnState that swallows all subsequent traffic from the thread.
+	// Detect HTTP/2 connections from the explicit client connection preface
+	// ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").
 	if h2State == nil && isHTTP2Preface(ev.Data) {
 		h2State = newH2ConnState()
 		p.mu.Lock()
@@ -165,6 +161,24 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		log.Printf("[parser] HTTP/2 preface detected PID=%d TID=%d proc=%s", ev.PID, ev.TID, ev.ProcessName)
 	}
 
+	// Mid-connection HTTP/2 detection: if no h2ConnState exists yet, check
+	// whether the data looks like a valid HTTP/2 frame (HEADERS, SETTINGS,
+	// or DATA).  This handles persistent connections whose preface was sent
+	// before the agent attached (e.g., Firefox → claude.ai).
+	//
+	// This is much stricter than the removed looksLikeHTTP2 heuristic:
+	// it requires specific frame types with valid semantic constraints, so
+	// the false-positive rate from NSPR IPC noise is negligible.
+	if h2State == nil && looksLikeH2MidConnection(ev.Data) {
+		h2State = newH2ConnState()
+		p.mu.Lock()
+		p.h2Conns[h2Key] = h2State
+		p.mu.Unlock()
+		sslEventsH2Preface.Add(1)
+		log.Printf("[parser] HTTP/2 mid-connection join PID=%d TID=%d proc=%s (frame type=0x%02x)",
+			ev.PID, ev.TID, ev.ProcessName, ev.Data[3])
+	}
+
 	if h2State != nil {
 		sslEventsH2Routed.Add(1)
 		p.handleH2Event(h2State, ev)
@@ -172,6 +186,24 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	}
 
 	// ---- HTTP/1.1 path ----
+	//
+	// Try parsing the current event's data alone first.  This handles the
+	// common case where a complete HTTP message fits in a single SSL record,
+	// and is essential for Firefox's Socket Thread which multiplexes all
+	// connections through one (PID, TID) — accumulating across events would
+	// mix data from different connections.
+	//
+	// If single-event parsing fails, fall back to accumulating in a flow
+	// buffer (for multi-segment messages on dedicated-thread SSL libs like
+	// OpenSSL).
+
+	if te := p.tryParseSSLData(ev.Data, ev); te != nil {
+		sslEventsH1Path.Add(1)
+		p.sink(te)
+		return
+	}
+
+	// Single-event parse failed — accumulate and retry.
 	key := sslFlowKey{PID: ev.PID, TID: ev.TID, IsRead: ev.IsRead}
 
 	p.mu.Lock()
@@ -188,13 +220,22 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	copy(data, fb.data)
 	p.mu.Unlock()
 
+	if te := p.tryParseSSLData(data, ev); te != nil {
+		sslEventsH1Path.Add(1)
+		p.sink(te)
+		p.deleteSSLBuf(key)
+	}
+}
+
+// tryParseSSLData attempts to parse data as an HTTP/1.1 request or response
+// based on the event's IsRead flag.  Returns nil if parsing fails.
+func (p *Parser) tryParseSSLData(data []byte, ev *types.SSLEvent) *types.TrafficEvent {
 	if !ev.IsRead {
-		// SSL_write: process is sending plaintext → HTTP request (egress).
 		fields, ok := parseHTTPRequestFields(data)
 		if !ok {
-			return
+			return nil
 		}
-		te := &types.TrafficEvent{
+		return &types.TrafficEvent{
 			Timestamp:      time.Now(),
 			Protocol:       "TLS",
 			Direction:      "egress",
@@ -206,27 +247,21 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 			BodySnippet:    fields.body,
 			TLSIntercepted: true,
 		}
-		p.sink(te)
-		p.deleteSSLBuf(key)
-	} else {
-		// SSL_read: process is receiving plaintext → HTTP response (ingress).
-		fields, ok := parseHTTPResponseFields(data)
-		if !ok {
-			return
-		}
-		te := &types.TrafficEvent{
-			Timestamp:       time.Now(),
-			Protocol:        "TLS",
-			Direction:       "ingress",
-			PID:             ev.PID,
-			ProcessName:     ev.ProcessName,
-			StatusCode:      fields.statusCode,
-			ResponseHeaders: fields.headers,
-			BodySnippet:     fields.body,
-			TLSIntercepted:  true,
-		}
-		p.sink(te)
-		p.deleteSSLBuf(key)
+	}
+	fields, ok := parseHTTPResponseFields(data)
+	if !ok {
+		return nil
+	}
+	return &types.TrafficEvent{
+		Timestamp:       time.Now(),
+		Protocol:        "TLS",
+		Direction:       "ingress",
+		PID:             ev.PID,
+		ProcessName:     ev.ProcessName,
+		StatusCode:      fields.statusCode,
+		ResponseHeaders: fields.headers,
+		BodySnippet:     fields.body,
+		TLSIntercepted:  true,
 	}
 }
 

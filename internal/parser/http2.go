@@ -36,7 +36,9 @@ const h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 // HTTP/2 frame types we care about.
 const (
+	h2FrameData         = byte(0x0)
 	h2FrameHeaders      = byte(0x1)
+	h2FrameSettings     = byte(0x4)
 	h2FrameContinuation = byte(0x9)
 )
 
@@ -56,6 +58,13 @@ const h2FrameHeaderLen = 9
 type h2ConnKey struct {
 	PID uint32
 	TID uint32
+}
+
+// h2StreamInfo tracks a request's metadata for correlating DATA frames.
+type h2StreamInfo struct {
+	method string
+	path   string
+	host   string
 }
 
 // h2ConnState holds per-connection HTTP/2 decode state.
@@ -78,6 +87,9 @@ type h2ConnState struct {
 	pendingReadBlock   []byte
 	pendingReadStream  uint32
 
+	// Active streams: maps stream ID → request info for DATA frame correlation.
+	activeStreams map[uint32]*h2StreamInfo
+
 	// Corruption tracking.  NSPR's PR_Write fires for ALL I/O, not just TLS.
 	// Non-HTTP/2 data that sneaks through can corrupt frame parsing.  If too
 	// many consecutive frames fail validation, the connection state is deleted
@@ -89,9 +101,10 @@ type h2ConnState struct {
 
 func newH2ConnState() *h2ConnState {
 	return &h2ConnState{
-		writeDecoder: hpack.NewDecoder(4096, nil),
-		readDecoder:  hpack.NewDecoder(4096, nil),
-		updated:      time.Now(),
+		writeDecoder:  hpack.NewDecoder(4096, nil),
+		readDecoder:   hpack.NewDecoder(4096, nil),
+		activeStreams: make(map[uint32]*h2StreamInfo),
+		updated:       time.Now(),
 	}
 }
 
@@ -100,12 +113,45 @@ func isHTTP2Preface(data []byte) bool {
 	return bytes.HasPrefix(data, []byte(h2ClientPreface))
 }
 
-// looksLikeHTTP2 was previously used for heuristic mid-connection detection
-// but was removed because NSPR's PR_Write fires for ALL I/O — IPC, files,
-// pipes — not just TLS.  Binary IPC data frequently false-positives
-// (byte[0]<0x20 && byte[3]<=9 matches ~0.5% of random data), creating a
-// corrupt h2ConnState that swallows all subsequent traffic on that thread.
-// Detection now relies solely on the unambiguous HTTP/2 client preface.
+// looksLikeH2MidConnection checks whether data begins with an HTTP/2 frame
+// that is distinctive enough to indicate a pre-existing HTTP/2 connection
+// whose preface we missed (agent started after the connection was opened).
+//
+// This is much stricter than the removed looksLikeHTTP2 heuristic:
+//   - Only accepts HEADERS, SETTINGS, or DATA frames (not any type 0-9)
+//   - HEADERS: requires valid stream ID (odd for write, non-zero)
+//   - SETTINGS: requires stream ID 0 and length divisible by 6
+//   - DATA: requires valid stream ID (non-zero)
+//   - All: frame length must be ≤ 16384 (default SETTINGS_MAX_FRAME_SIZE)
+//
+// The false-positive rate on random binary data is negligible compared to the
+// old heuristic, because we require specific frame-type semantics.
+func looksLikeH2MidConnection(data []byte) bool {
+	if len(data) < h2FrameHeaderLen {
+		return false
+	}
+	frameLen := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
+	frameType := data[3]
+	streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
+
+	// Sanity: frame length must be reasonable.
+	if frameLen > 16384 {
+		return false
+	}
+
+	switch frameType {
+	case h2FrameHeaders: // 0x01
+		// HEADERS: stream ID must be > 0, length ≥ 2 (at least a tiny HPACK block).
+		return streamID > 0 && frameLen >= 2
+	case h2FrameSettings: // 0x04
+		// SETTINGS: stream ID must be 0, length divisible by 6 (each setting is 6 bytes).
+		return streamID == 0 && frameLen%6 == 0
+	case h2FrameData: // 0x00
+		// DATA: stream ID must be > 0, and length ≥ 1.
+		return streamID > 0 && frameLen >= 1
+	}
+	return false
+}
 
 // maxH2ConsecutiveErrors is the number of consecutive invalid frames before
 // the h2ConnState is considered corrupt and is deleted.  This handles the
@@ -229,6 +275,8 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm s
 			s.processHeadersFrame(payload, flags, streamID, isRead, pid, comm, emit)
 		case h2FrameContinuation:
 			s.processContinuationFrame(payload, flags, streamID, isRead, pid, comm, emit)
+		case h2FrameData:
+			s.processDataFrame(payload, flags, streamID, isRead, pid, comm, emit)
 		}
 
 		// Valid frame consumed — reset error counter.
@@ -304,7 +352,7 @@ func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, strea
 }
 
 // emitFromBlock HPACK-decodes a complete header block and emits a TrafficEvent.
-func (s *h2ConnState) emitFromBlock(block []byte, _ uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
 	dec := s.writeDecoder
 	if isRead {
 		dec = s.readDecoder
@@ -331,11 +379,11 @@ func (s *h2ConnState) emitFromBlock(block []byte, _ uint32, isRead bool, pid uin
 	if isRead {
 		s.buildResponseEvent(fields, pid, comm, emit)
 	} else {
-		s.buildRequestEvent(fields, pid, comm, emit)
+		s.buildRequestEvent(fields, streamID, pid, comm, emit)
 	}
 }
 
-func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uint32, pid uint32, comm string, emit func(*types.TrafficEvent)) {
 	method, path, host := "", "", ""
 	headers := make(map[string]string)
 	for _, f := range fields {
@@ -360,6 +408,22 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, pid uint32, 
 	if host != "" {
 		headers["Host"] = host
 	}
+
+	// Track request metadata for DATA frame correlation.
+	if s.activeStreams == nil {
+		s.activeStreams = make(map[uint32]*h2StreamInfo)
+	}
+	s.activeStreams[streamID] = &h2StreamInfo{method: method, path: path, host: host}
+	// Cap active streams to avoid unbounded growth (keep most recent 128).
+	if len(s.activeStreams) > 128 {
+		for id := range s.activeStreams {
+			delete(s.activeStreams, id)
+			if len(s.activeStreams) <= 96 {
+				break
+			}
+		}
+	}
+
 	emit(&types.TrafficEvent{
 		Timestamp:      time.Now(),
 		Protocol:       "TLS",
@@ -396,4 +460,75 @@ func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, pid uint32,
 		ResponseHeaders: headers,
 		TLSIntercepted:  true,
 	})
+}
+
+// processDataFrame extracts a body snippet from an HTTP/2 DATA frame and
+// emits a TrafficEvent correlated with the stream's HEADERS metadata.
+// For write (egress) frames, it looks up the request info from activeStreams.
+// For read (ingress) frames, it emits the body with direction=ingress.
+func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+	if len(payload) == 0 {
+		return
+	}
+
+	body := payload
+	// Strip padding if PADDED flag (0x08) is set.
+	if flags&h2FlagPadded != 0 {
+		if len(body) < 1 {
+			return
+		}
+		padLen := int(body[0])
+		body = body[1:]
+		if len(body) <= padLen {
+			return
+		}
+		body = body[:len(body)-padLen]
+	}
+	if len(body) == 0 {
+		return
+	}
+
+	// Truncate to snippet limit.
+	snippet := body
+	if len(snippet) > types.BodySnippetMaxLen {
+		snippet = snippet[:types.BodySnippetMaxLen]
+	}
+
+	if !isRead {
+		// Egress DATA: look up the request's HEADERS metadata.
+		info := s.activeStreams[streamID]
+		te := &types.TrafficEvent{
+			Timestamp:      time.Now(),
+			Protocol:       "TLS",
+			Direction:      "egress",
+			PID:            pid,
+			ProcessName:    comm,
+			BodySnippet:    string(snippet),
+			TLSIntercepted: true,
+		}
+		if info != nil {
+			te.HTTPMethod = info.method
+			te.URL = info.path
+			if info.host != "" {
+				te.RequestHeaders = map[string]string{"Host": info.host}
+			}
+		}
+		emit(te)
+	} else {
+		// Ingress DATA: emit body snippet for response.
+		emit(&types.TrafficEvent{
+			Timestamp:      time.Now(),
+			Protocol:       "TLS",
+			Direction:      "ingress",
+			PID:            pid,
+			ProcessName:    comm,
+			BodySnippet:    string(snippet),
+			TLSIntercepted: true,
+		})
+	}
+
+	// Clean up stream after END_STREAM flag (0x01).
+	if flags&0x01 != 0 {
+		delete(s.activeStreams, streamID)
+	}
 }

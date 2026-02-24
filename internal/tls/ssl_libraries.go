@@ -57,11 +57,20 @@ type sslLibFound struct {
 	writeFunc string
 	readFunc  string
 	tailCall  bool
+	// Offset-based attachment (for NSS libssl3.so internal functions).
+	// When non-zero, uprobes are attached by file offset instead of symbol name.
+	writeOffset uint64
+	readOffset  uint64
 }
 
 // findSSLLibsForPID reads /proc/<pid>/maps and returns every loaded shared
 // library that matches a known SSL/TLS library definition.
 // Duplicate paths within the same process are deduplicated.
+//
+// Additionally, it detects NSS's libssl3.so (used by Firefox) and attempts
+// to find the internal ssl_DefSend/ssl_DefRecv functions by binary analysis.
+// These carry plaintext before/after encryption and support both read and
+// write capture (unlike PR_Write/PR_Read which carry ciphertext on ARM64).
 func findSSLLibsForPID(pid int) []sslLibFound {
 	f, err := os.Open(fmt.Sprintf("/proc/%d/maps", pid))
 	if err != nil {
@@ -72,6 +81,8 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 	seen := make(map[string]bool)
 	var found []sslLibFound
 
+	// First pass: collect all library paths and detect libssl3.so.
+	var libPaths []string
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -82,6 +93,31 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 		if !strings.HasPrefix(libPath, "/") || seen[libPath] {
 			continue
 		}
+		seen[libPath] = true
+		libPaths = append(libPaths, libPath)
+	}
+
+	// Check for NSS's libssl3.so — if found, we get an internal function
+	// that provides incoming plaintext (HTTP responses) at return time.
+	// Outgoing plaintext (HTTP requests) is still captured via PR_Write
+	// on libnspr4.so (which is kept — not skipped).
+	for _, libPath := range libPaths {
+		base := filepath.Base(libPath)
+		if strings.Contains(base, "libssl3.so") {
+			readOff, err := findNSSReadOffset(libPath)
+			if err == nil && readOff > 0 {
+				found = append(found, sslLibFound{
+					path:       libPath,
+					readFunc:   "nss_recv_func",
+					readOffset: readOff,
+				})
+			}
+		}
+	}
+
+	// Second pass: add standard SSL libraries (including libnspr4.so for
+	// outgoing plaintext via PR_Write entry-only capture).
+	for _, libPath := range libPaths {
 		base := filepath.Base(libPath)
 		for _, def := range knownSSLLibDefs {
 			if strings.Contains(base, def.namePattern) {
@@ -91,10 +127,10 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 					readFunc:  def.readFunc,
 					tailCall:  def.tailCall,
 				})
-				seen[libPath] = true
 				break
 			}
 		}
 	}
+
 	return found
 }

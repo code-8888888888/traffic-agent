@@ -167,7 +167,13 @@ func (i *Interceptor) AttachToPID(pid int) error {
 func (i *Interceptor) attachToPID(pid int) error {
 	n := 0
 	for _, lib := range findSSLLibsForPID(pid) {
-		if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid, lib.tailCall); err != nil {
+		var err error
+		if lib.writeOffset != 0 || lib.readOffset != 0 {
+			err = i.attachToLibByOffset(lib, pid)
+		} else {
+			err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid, lib.tailCall)
+		}
+		if err != nil {
 			log.Printf("[tls] PID %d %s: %v", pid, filepath.Base(lib.path), err)
 			continue
 		}
@@ -209,17 +215,29 @@ func (i *Interceptor) attachGlobal() error {
 
 		// Scan shared libraries loaded by this process.
 		for _, lib := range findSSLLibsForPID(pid) {
+			// For offset-based libs (NSS libssl3.so), use a unique key that
+			// includes the offset so it doesn't conflict with the symbol-based
+			// attachment of the same path.
+			attachKey := lib.path
+			if lib.readOffset != 0 {
+				attachKey = fmt.Sprintf("%s@read=0x%x", lib.path, lib.readOffset)
+			}
 			i.mu.Lock()
-			seen := i.attachedLibs[lib.path]
+			seen := i.attachedLibs[attachKey]
 			if !seen {
-				// Mark as seen before attempting so errors are logged only once.
-				i.attachedLibs[lib.path] = true
+				i.attachedLibs[attachKey] = true
 			}
 			i.mu.Unlock()
 			if seen {
 				continue
 			}
-			if err := i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0, lib.tailCall); err != nil {
+			var err error
+			if lib.writeOffset != 0 || lib.readOffset != 0 {
+				err = i.attachToLibByOffset(lib, 0)
+			} else {
+				err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0, lib.tailCall)
+			}
+			if err != nil {
 				log.Printf("[tls] %s: %v", filepath.Base(lib.path), err)
 			}
 		}
@@ -246,6 +264,68 @@ func (i *Interceptor) attachGlobal() error {
 		}
 	}
 
+	return nil
+}
+
+// attachToLibByOffset attaches SSL uprobe programs using file offsets rather
+// than symbol names.  Used for stripped binaries where the internal functions
+// are not exported (e.g., NSS libssl3.so).
+//
+// For NSS, only readOffset is set — it points to an internal function that
+// fills a buffer with decrypted plaintext during execution.  We attach
+// entry+return probes so the data is captured at return time.
+//
+// writeOffset may be 0 (not available from libssl3.so); outgoing plaintext
+// is captured separately via PR_Write on libnspr4.so.
+func (i *Interceptor) attachToLibByOffset(lib sslLibFound, pid int) error {
+	ex, err := link.OpenExecutable(lib.path)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", lib.path, err)
+	}
+
+	type probeSpec struct {
+		prog   *ebpf.Program
+		ret    bool
+		offset uint64
+	}
+	var probes []probeSpec
+
+	if lib.writeOffset != 0 {
+		probes = append(probes,
+			probeSpec{i.objs.UprobeSslWriteEntryCap, false, lib.writeOffset},
+		)
+	}
+	if lib.readOffset != 0 {
+		probes = append(probes,
+			probeSpec{i.objs.UprobeSslReadEntry, false, lib.readOffset},
+			probeSpec{i.objs.UretprobeSslReadRet, true, lib.readOffset},
+		)
+	}
+
+	for _, p := range probes {
+		opts := &link.UprobeOptions{
+			PID:     pid,
+			Address: p.offset,
+		}
+		var l link.Link
+		if p.ret {
+			l, err = ex.Uretprobe("nss_recv_func", p.prog, opts)
+		} else {
+			l, err = ex.Uprobe("nss_recv_func", p.prog, opts)
+		}
+		if err != nil {
+			return fmt.Errorf("attach NSS uprobe (ret=%v, addr=0x%x): %w", p.ret, p.offset, err)
+		}
+		i.links = append(i.links, l)
+	}
+
+	if pid == 0 {
+		log.Printf("[tls] attached NSS read uprobes to %s (recv=0x%x) [entry+return]",
+			filepath.Base(lib.path), lib.readOffset)
+	} else {
+		log.Printf("[tls] attached NSS read uprobes to PID %d via %s (recv=0x%x)",
+			pid, filepath.Base(lib.path), lib.readOffset)
+	}
 	return nil
 }
 
