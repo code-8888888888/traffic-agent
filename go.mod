@@ -17,4 +17,5 @@ require (
 require (
 	github.com/vishvananda/netns v0.0.4 // indirect
 	golang.org/x/exp v0.0.0-20230224173230-c95f2b4c22f2 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 )
