@@ -33,6 +33,10 @@ type sslLibDef struct {
 	// capture program for writes and skips read probes entirely.
 	// NSS/NSPR's PR_Write and PR_Read are the primary examples.
 	tailCall bool
+	// isWritev indicates that writeFunc takes a scatter-gather iov array
+	// (fd, iov, count, timeout) instead of a direct buffer (fd, buf, len).
+	// Requires the writev-specific BPF program.
+	isWritev bool
 }
 
 // knownSSLLibDefs is the table of all SSL/TLS libraries whose I/O functions
@@ -52,6 +56,11 @@ var knownSSLLibDefs = []sslLibDef{
 	// Same ABI as PR_Write/PR_Read (fd, buf, len as first 3 params), same tail-call.
 	// Firefox uses PR_Send for H2 frame writes, PR_Write for H1 and IPC.
 	{namePattern: "libnspr4.so", writeFunc: "PR_Send", readFunc: "PR_Recv", tailCall: true},
+	// PR_Writev — scatter-gather write used by Firefox's HTTP/2 engine.
+	// Different ABI: (fd, iov_array, iov_count, timeout) instead of (fd, buf, len).
+	// Requires a dedicated BPF program that reads the PRIOVec array.
+	// Same tail-call pattern as PR_Write (ldr; ldr; br on ARM64).
+	{namePattern: "libnspr4.so", writeFunc: "PR_Writev", readFunc: "", tailCall: true, isWritev: true},
 }
 
 // sslLibFound holds a resolved shared-library path and the function names to
@@ -61,6 +70,7 @@ type sslLibFound struct {
 	writeFunc string
 	readFunc  string
 	tailCall  bool
+	isWritev  bool
 	// Offset-based attachment (for NSS libssl3.so internal functions).
 	// When non-zero, uprobes are attached by file offset instead of symbol name.
 	writeOffset uint64
@@ -139,6 +149,7 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 					writeFunc: def.writeFunc,
 					readFunc:  def.readFunc,
 					tailCall:  def.tailCall,
+					isWritev:  def.isWritev,
 				})
 			}
 		}

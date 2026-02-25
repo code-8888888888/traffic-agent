@@ -185,7 +185,7 @@ func (i *Interceptor) attachToPID(pid int) error {
 		if lib.writeOffset != 0 || lib.readOffset != 0 {
 			err = i.attachToLibByOffset(lib, pid)
 		} else {
-			err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid, lib.tailCall)
+			err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, pid, lib.tailCall, lib.isWritev)
 		}
 		if err != nil {
 			log.Printf("[tls] PID %d %s: %v", pid, filepath.Base(lib.path), err)
@@ -263,7 +263,7 @@ func (i *Interceptor) attachGlobal() error {
 			if lib.writeOffset != 0 || lib.readOffset != 0 {
 				err = i.attachToLibByOffset(lib, 0)
 			} else {
-				err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0, lib.tailCall)
+				err = i.attachToLib(lib.path, lib.writeFunc, lib.readFunc, 0, lib.tailCall, lib.isWritev)
 			}
 			if err != nil {
 				log.Printf("[tls] %s: %v", filepath.Base(lib.path), err)
@@ -378,7 +378,10 @@ func (i *Interceptor) attachToLibByOffset(lib sslLibFound, pid int) error {
 // In that case uretprobes will never fire, so the agent uses an entry-only
 // write capture program and skips read probes entirely.
 // NSS/NSPR (libnspr4.so) is the canonical example.
-func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int, tailCall bool) error {
+//
+// isWritev must be set for scatter-gather write functions (PR_Writev) that
+// take an iov array instead of a direct buffer pointer.
+func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int, tailCall, isWritev bool) error {
 	ex, err := link.OpenExecutable(path)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", path, err)
@@ -394,8 +397,12 @@ func (i *Interceptor) attachToLib(path, writeFunc, readFunc string, pid int, tai
 		// PR_Write / PR_Read are 3-instruction tail-calls on ARM64.
 		// Only attach an entry-only write probe; reads are not interceptable
 		// without private NSS symbol access.
+		prog := i.objs.UprobeSslWriteEntryCap
+		if isWritev {
+			prog = i.objs.UprobeSslWritevEntryCap
+		}
 		probes = []probeSpec{
-			{writeFunc, i.objs.UprobeSslWriteEntryCap, false},
+			{writeFunc, prog, false},
 		}
 	} else {
 		probes = []probeSpec{

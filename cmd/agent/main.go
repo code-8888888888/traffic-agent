@@ -79,6 +79,9 @@ func main() {
 
 	// ---- Build parser ----
 	p := parser.New(sink)
+	if *verbose {
+		parser.SetH2Debug(true)
+	}
 
 	// ---- Start TC packet capture ----
 	rawPacketCh := make(chan *types.RawPacketEvent, 4096)

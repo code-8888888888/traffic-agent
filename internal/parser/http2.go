@@ -16,12 +16,14 @@
 //     preface.
 //   - HPACK dynamic table is lost if the agent starts mid-connection.
 //     Decode errors reset the decoder so subsequent frames from new
-//     connections work.
+//     connections work.  SETTINGS_HEADER_TABLE_SIZE is tracked so
+//     servers negotiating larger tables (e.g. 65536) don't break decoding.
 package parser
 
 import (
 	"bytes"
 	"encoding/binary"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -32,6 +34,13 @@ import (
 
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
+
+// defaultHPACKTableSize is the initial HPACK dynamic table size (4096 per spec).
+// allowedHPACKTableSize is the maximum the decoder allows via dynamic table
+// size updates in the HPACK stream.  Servers commonly negotiate 65536 via
+// SETTINGS_HEADER_TABLE_SIZE.  We set a generous upper bound so that
+// dynamic table size updates are never rejected.
+const allowedHPACKTableSize = 65536
 
 // h2ClientPreface is the fixed 24-byte string that every HTTP/2 client sends
 // at the start of a connection before any frames.
@@ -133,10 +142,19 @@ type h2ConnState struct {
 	updated time.Time
 }
 
+// newHPACKDecoder creates an HPACK decoder with a generous allowed max
+// dynamic table size so that servers negotiating larger tables (common:
+// 65536) don't cause "dynamic table size update too large" errors.
+func newHPACKDecoder() *hpack.Decoder {
+	d := hpack.NewDecoder(4096, nil)
+	d.SetAllowedMaxDynamicTableSize(allowedHPACKTableSize)
+	return d
+}
+
 func newH2ConnState() *h2ConnState {
 	return &h2ConnState{
-		writeDecoder: hpack.NewDecoder(4096, nil),
-		readDecoder:  hpack.NewDecoder(4096, nil),
+		writeDecoder: newHPACKDecoder(),
+		readDecoder:  newHPACKDecoder(),
 		activeStreams: make(map[uint32]*h2StreamInfo),
 		maxFrameSize: 16384,
 		updated:      time.Now(),
@@ -169,8 +187,9 @@ func looksLikeH2MidConnection(data []byte) bool {
 	frameType := data[3]
 	streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 
-	// Sanity: frame length must be reasonable.
-	if frameLen > 16384 {
+	// Sanity: frame length must be reasonable.  Use a generous upper bound
+	// since connections may have negotiated a larger SETTINGS_MAX_FRAME_SIZE.
+	if frameLen > 1<<20 {
 		return false
 	}
 
@@ -205,6 +224,12 @@ var (
 	h2cFramesParsed        atomic.Int64
 )
 
+// debugH2 enables verbose H2 frame-level logging.
+var debugH2 atomic.Bool
+
+// SetH2Debug enables/disables H2 frame-level debug logging.
+func SetH2Debug(on bool) { debugH2.Store(on) }
+
 // H2CStats returns snapshot counters for h2c connections and frames.
 func H2CStats() (connections, frames int64) {
 	return h2cConnectionsDetected.Load(), h2cFramesParsed.Load()
@@ -229,8 +254,8 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 			// navigating to a new domain sends a new preface on the
 			// same thread.  Stale HPACK tables and activeStreams from
 			// the previous domain must be cleared.
-			state.writeDecoder = hpack.NewDecoder(4096, nil)
-			state.readDecoder = hpack.NewDecoder(4096, nil)
+			state.writeDecoder = newHPACKDecoder()
+			state.readDecoder = newHPACKDecoder()
 			state.activeStreams = make(map[uint32]*h2StreamInfo)
 			state.writeBuf = nil
 			state.readBuf = nil
@@ -252,6 +277,10 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 		// partial frame.  Validate that new data looks like HTTP/2 frames
 		// to filter out non-TLS PR_Write noise (IPC, files, etc.).
 		if len(state.writeBuf) == 0 && !isValidH2FrameStart(d) {
+			if debugH2.Load() && len(d) >= 4 {
+				log.Printf("[h2-debug] REJECTED write data pid=%d len=%d firstbytes=%x",
+					meta.PID, len(d), d[:min(8, len(d))])
+			}
 			p.mu.Unlock()
 			return
 		}
@@ -267,6 +296,10 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 	} else {
 		// Incoming: server -> browser.
 		if len(state.readBuf) == 0 && !isValidH2FrameStart(data) {
+			if debugH2.Load() && len(data) >= 4 {
+				log.Printf("[h2-debug] REJECTED read data pid=%d len=%d firstbytes=%x",
+					meta.PID, len(data), data[:min(8, len(data))])
+			}
 			p.mu.Unlock()
 			return
 		}
@@ -349,7 +382,7 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, meta *h2EventMeta,
 		case h2FrameRSTStream:
 			s.processRSTStream(streamID)
 		case h2FrameSettings:
-			s.processSettings(payload, flags)
+			s.processSettings(payload, flags, isRead)
 		case h2FrameGoaway:
 			s.processGoaway(payload)
 		case h2FramePushPromise:
@@ -467,13 +500,15 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 	dec.SetEmitEnabled(false)
 
 	if err != nil {
+		log.Printf("[h2] HPACK decode error (isRead=%v stream=%d): %v", isRead, streamID, err)
+
 		// Dynamic table out of sync (agent missed earlier frames or
 		// garbage data leaked in).  Replace the stored decoder with a
-		// fresh one so future frames decode correctly.
+		// fresh one so future frames on NEW connections decode correctly.
 		if isRead {
-			s.readDecoder = hpack.NewDecoder(4096, nil)
+			s.readDecoder = newHPACKDecoder()
 		} else {
-			s.writeDecoder = hpack.NewDecoder(4096, nil)
+			s.writeDecoder = newHPACKDecoder()
 		}
 
 		// Strategy 1: use partial fields already captured by emit callback.
@@ -483,7 +518,7 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 		// Strategy 2: if no partial fields, retry with a throwaway fresh
 		// decoder.  Static table entries decode without dynamic table state.
 		if len(fields) == 0 {
-			retryDec := hpack.NewDecoder(4096, nil)
+			retryDec := newHPACKDecoder()
 			retryDec.SetEmitFunc(func(f hpack.HeaderField) { fields = append(fields, f) })
 			retryDec.Write(block) // ignore error — we just want static-table entries
 		}
@@ -519,6 +554,10 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 				headers[http.CanonicalHeaderKey(f.Name)] = f.Value
 			}
 		}
+	}
+	if debugH2.Load() {
+		log.Printf("[h2-debug] request stream=%d method=%q path=%q host=%q nheaders=%d",
+			streamID, method, path, host, len(fields))
 	}
 	if method == "" {
 		return // trailers — skip
@@ -574,6 +613,10 @@ func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, streamID ui
 				contentEncoding = f.Value
 			}
 		}
+	}
+	if debugH2.Load() {
+		log.Printf("[h2-debug] response stream=%d status=%d nheaders=%d",
+			streamID, statusCode, len(fields))
 	}
 	if statusCode == 0 {
 		return // trailers
@@ -706,8 +749,14 @@ func (s *h2ConnState) processRSTStream(streamID uint32) {
 }
 
 // processSettings handles SETTINGS frames.  Tracks SETTINGS_MAX_FRAME_SIZE
-// and skips ACK frames (flag 0x01, empty payload).
-func (s *h2ConnState) processSettings(payload []byte, flags byte) {
+// and SETTINGS_HEADER_TABLE_SIZE, and skips ACK frames (flag 0x01).
+//
+// isRead indicates direction: when the server sends SETTINGS (isRead=true),
+// SETTINGS_HEADER_TABLE_SIZE controls the client's encoder table size, which
+// corresponds to our writeDecoder.  When the client sends SETTINGS
+// (isRead=false), it controls the server's encoder table size, which
+// corresponds to our readDecoder.
+func (s *h2ConnState) processSettings(payload []byte, flags byte, isRead bool) {
 	// ACK frame: flag 0x01, must have empty payload.
 	if flags&0x01 != 0 {
 		return
@@ -718,8 +767,18 @@ func (s *h2ConnState) processSettings(payload []byte, flags byte) {
 		settingVal := binary.BigEndian.Uint32(payload[2:6])
 		payload = payload[6:]
 
-		// SETTINGS_MAX_FRAME_SIZE (0x5).
-		if settingID == 0x5 {
+		switch settingID {
+		case 0x1: // SETTINGS_HEADER_TABLE_SIZE
+			// The sender is telling the receiver what max table size to use
+			// when encoding headers.  From our perspective:
+			//   server sends (isRead) -> controls client's encoder -> writeDecoder
+			//   client sends (!isRead) -> controls server's encoder -> readDecoder
+			if isRead {
+				s.writeDecoder.SetAllowedMaxDynamicTableSize(settingVal)
+			} else {
+				s.readDecoder.SetAllowedMaxDynamicTableSize(settingVal)
+			}
+		case 0x5: // SETTINGS_MAX_FRAME_SIZE
 			if settingVal >= 16384 && settingVal <= 16777215 {
 				s.maxFrameSize = int(settingVal)
 			}

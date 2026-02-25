@@ -273,6 +273,100 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * PR_Writev entry-only capture (scatter-gather write)
+ *
+ * NSPR's PR_Writev is a scatter-gather variant of PR_Write.  Firefox's
+ * HTTP/2 engine uses it to send multiple H2 frames in a single call.
+ * Like PR_Write, it is a 3-instruction indirect tail-call on ARM64:
+ *
+ *   PR_Writev(fd, iov, iov_size, timeout):
+ *     ldr x8, [x0]          ; fd->methods
+ *     ldr x4, [x8, #88]     ; methods->writev
+ *     br  x4                 ; tail-call
+ *
+ * Calling convention (ARM64):
+ *   arg1 (x0) = PRFileDesc *fd   — connection identifier
+ *   arg2 (x1) = PRIOVec *iov     — array of {void *iov_base; PRInt32 iov_len}
+ *   arg3 (x2) = PRInt32 iov_size — number of entries
+ *   arg4 (x3) = PRIntervalTime   — timeout (ignored)
+ *
+ * PRIOVec layout on 64-bit: { char *iov_base (8 bytes), int iov_len (4 bytes),
+ *   4 bytes padding } = 16 bytes per entry.
+ *
+ * Emits one ssl_event per non-empty iov entry for simplicity.  The
+ * userspace parser accumulates per-ConnID, so fragmented H2 frames
+ * across iov entries are reassembled correctly.
+ * --------------------------------------------------------------------- */
+
+#define PRIOVEC_STRIDE 16   /* sizeof(PRIOVec) on 64-bit */
+#define MAX_WRITEV_IOV 8    /* PR_Writev rejects >16; 8 is ample for H2 */
+
+SEC("uprobe/SSL_writev_entry_cap")
+int uprobe_ssl_writev_entry_cap(struct pt_regs *ctx)
+{
+    __u64 iov_ptr = PT_REGS_PARM2(ctx);
+    __u32 iov_cnt = (__u32)PT_REGS_PARM3(ctx);
+
+    if (iov_cnt == 0 || iov_ptr == 0)
+        return 0;
+
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 pid      = pid_tgid >> 32;
+    __u32 tid      = (__u32)pid_tgid;
+    __u32 uid      = (__u32)bpf_get_current_uid_gid();
+    __u64 conn_id  = PT_REGS_PARM1(ctx);
+    __u64 ts       = bpf_ktime_get_ns();
+    __u8  comm[TASK_COMM_LEN];
+    bpf_get_current_comm(comm, sizeof(comm));
+
+    if (iov_cnt > MAX_WRITEV_IOV)
+        iov_cnt = MAX_WRITEV_IOV;
+
+    /* Emit one event per iov entry.  Bounded loop — kernel 5.8+ required. */
+    for (__u32 i = 0; i < MAX_WRITEV_IOV; i++) {
+        if (i >= iov_cnt)
+            break;
+
+        __u64 base = 0;
+        __u32 len  = 0;
+
+        if (bpf_probe_read_user(&base, sizeof(base),
+                (void *)(iov_ptr + (__u64)i * PRIOVEC_STRIDE)) < 0)
+            break;
+        if (bpf_probe_read_user(&len, sizeof(len),
+                (void *)(iov_ptr + (__u64)i * PRIOVEC_STRIDE + 8)) < 0)
+            break;
+
+        if (base == 0 || len == 0)
+            continue;
+
+        struct ssl_event *ev = bpf_ringbuf_reserve(&ssl_events, sizeof(*ev), 0);
+        if (!ev)
+            return 0;
+
+        ev->timestamp_ns = ts;
+        ev->conn_id      = conn_id;
+        ev->pid          = pid;
+        ev->tid          = tid;
+        ev->uid          = uid;
+        ev->is_read      = 0;
+        __builtin_memcpy(ev->comm, comm, TASK_COMM_LEN);
+
+        __u32 data_len = len > MAX_SSL_DATA_SIZE ? MAX_SSL_DATA_SIZE : len;
+        ev->data_len = data_len;
+
+        if (bpf_probe_read_user(ev->data, data_len, (void *)base) < 0) {
+            bpf_ringbuf_discard(ev, 0);
+            continue;
+        }
+
+        bpf_ringbuf_submit(ev, 0);
+    }
+
+    return 0;
+}
+
 /*
  * TODO: Go crypto/tls interception
  *
