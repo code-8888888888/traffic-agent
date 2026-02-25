@@ -217,6 +217,87 @@ cleanup:
 }
 
 /* -----------------------------------------------------------------------
+ * NSPR PRFileDesc layered I/O — ConnID resolution
+ *
+ * NSPR uses a layered I/O model: PRFileDesc structs are stacked via
+ * the `lower` and `higher` pointers.  For Firefox HTTPS connections:
+ *
+ *   [Top-level PRFileDesc]  ← PR_Write/PR_Send/PR_Writev gets this (arg1)
+ *        │ lower (offset 16)
+ *        ▼
+ *   [SSL layer PRFileDesc]  ← ssl_SecureRecv in libssl3.so gets this (arg1)
+ *        │ lower (offset 16)
+ *        ▼
+ *   [TCP socket PRFileDesc]
+ *
+ * The write-side probes (PR_Write et al.) see the top-level fd, while
+ * the read-side probe (ssl_SecureRecv) sees the SSL-layer fd.  These
+ * are DIFFERENT pointers, so using arg1 directly as ConnID produces
+ * mismatched keys — writes and reads never correlate.
+ *
+ * Fix: dereference fd->lower (PRFileDesc.lower at offset 16) in the
+ * write-side probes to get the SSL layer's fd, which matches the read
+ * side.  If the read fails or lower is NULL, fall back to using fd.
+ * --------------------------------------------------------------------- */
+
+/* Offset of the `lower` field in struct PRFileDesc (stable across NSPR
+ * versions and 64-bit architectures: methods [0], secret [8], lower [16]). */
+#define PRFILEDESC_LOWER_OFFSET 16
+
+/* Maximum NSPR layer depth to walk.  Firefox typically has 2-3 layers
+ * (top → SSL → TCP, or top → filter → SSL → TCP).  4 is generous. */
+#define NSPR_MAX_LAYER_DEPTH 4
+
+/**
+ * nspr_resolve_conn_id — walk the PRFileDesc->lower chain to find the
+ * bottom-most fd (the TCP socket layer, where lower == NULL).  This fd
+ * is the same regardless of which layer the caller starts from, so both
+ * write-side (top-level fd from PR_Write) and read-side (SSL-layer fd
+ * from ssl_SecureRecv) converge on the same pointer.
+ *
+ * Manually unrolled for the BPF verifier (no loops).
+ * Falls back to returning the original fd if reads fail.
+ */
+static __always_inline __u64 nspr_resolve_conn_id(__u64 fd)
+{
+    __u64 cur = fd;
+    __u64 lower = 0;
+
+    /* Level 1 */
+    if (bpf_probe_read_user(&lower, sizeof(lower),
+                            (void *)(cur + PRFILEDESC_LOWER_OFFSET)) != 0
+        || lower == 0)
+        return cur;
+    cur = lower;
+
+    /* Level 2 */
+    lower = 0;
+    if (bpf_probe_read_user(&lower, sizeof(lower),
+                            (void *)(cur + PRFILEDESC_LOWER_OFFSET)) != 0
+        || lower == 0)
+        return cur;
+    cur = lower;
+
+    /* Level 3 */
+    lower = 0;
+    if (bpf_probe_read_user(&lower, sizeof(lower),
+                            (void *)(cur + PRFILEDESC_LOWER_OFFSET)) != 0
+        || lower == 0)
+        return cur;
+    cur = lower;
+
+    /* Level 4 */
+    lower = 0;
+    if (bpf_probe_read_user(&lower, sizeof(lower),
+                            (void *)(cur + PRFILEDESC_LOWER_OFFSET)) != 0
+        || lower == 0)
+        return cur;
+    cur = lower;
+
+    return cur;
+}
+
+/* -----------------------------------------------------------------------
  * SSL_write entry-only capture (for tail-calling write functions)
  *
  * Some SSL/TLS libraries implement their write function as an indirect
@@ -235,9 +316,12 @@ cleanup:
  *
  * Compatible calling convention (same as SSL_write):
  *   int fn(void *ctx, const void *buf, int num)
- *   arg1 (x0) = context pointer (ignored)
+ *   arg1 (x0) = PRFileDesc *fd  — top-level layered fd
  *   arg2 (x1) = buf  — plaintext data to write
  *   arg3 (x2) = num  — byte count
+ *
+ * ConnID: uses fd->lower (SSL layer fd) for correlation with the
+ * read-side ssl_SecureRecv probe in libssl3.so.
  * --------------------------------------------------------------------- */
 
 SEC("uprobe/SSL_write_entry_cap")
@@ -249,12 +333,16 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
     if (num == 0)
         return 0;
 
+    /* Resolve ConnID BEFORE ringbuf reserve to avoid verifier losing
+     * register bounds after the inlined bpf_probe_read_user calls. */
+    __u64 conn_id = nspr_resolve_conn_id(PT_REGS_PARM1(ctx));
+
     struct ssl_event *ev = bpf_ringbuf_reserve(&ssl_events, sizeof(*ev), 0);
     if (!ev)
         return 0;
 
     ev->timestamp_ns = bpf_ktime_get_ns();
-    ev->conn_id      = PT_REGS_PARM1(ctx);
+    ev->conn_id      = conn_id;
     ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
     ev->tid          = (__u32)bpf_get_current_pid_tgid();
     ev->uid          = (__u32)bpf_get_current_uid_gid();
@@ -262,6 +350,9 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
     bpf_get_current_comm(ev->comm, sizeof(ev->comm));
 
     __u32 data_len = num > MAX_SSL_DATA_SIZE ? MAX_SSL_DATA_SIZE : num;
+    /* Re-assert bounds for the BPF verifier after heavy inlining above.
+     * Use 2*MAX-1 so the full MAX_SSL_DATA_SIZE value is preserved. */
+    data_len &= (2 * MAX_SSL_DATA_SIZE - 1);
     ev->data_len = data_len;
 
     if (bpf_probe_read_user(ev->data, data_len, buf) < 0) {
@@ -286,7 +377,7 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
  *     br  x4                 ; tail-call
  *
  * Calling convention (ARM64):
- *   arg1 (x0) = PRFileDesc *fd   — connection identifier
+ *   arg1 (x0) = PRFileDesc *fd   — top-level layered fd
  *   arg2 (x1) = PRIOVec *iov     — array of {void *iov_base; PRInt32 iov_len}
  *   arg3 (x2) = PRInt32 iov_size — number of entries
  *   arg4 (x3) = PRIntervalTime   — timeout (ignored)
@@ -297,6 +388,9 @@ int uprobe_ssl_write_entry_cap(struct pt_regs *ctx)
  * Emits one ssl_event per non-empty iov entry for simplicity.  The
  * userspace parser accumulates per-ConnID, so fragmented H2 frames
  * across iov entries are reassembled correctly.
+ *
+ * ConnID: uses fd->lower (SSL layer fd) for correlation with the
+ * read-side ssl_SecureRecv probe in libssl3.so.
  * --------------------------------------------------------------------- */
 
 #define PRIOVEC_STRIDE 16   /* sizeof(PRIOVec) on 64-bit */
@@ -315,7 +409,7 @@ int uprobe_ssl_writev_entry_cap(struct pt_regs *ctx)
     __u32 pid      = pid_tgid >> 32;
     __u32 tid      = (__u32)pid_tgid;
     __u32 uid      = (__u32)bpf_get_current_uid_gid();
-    __u64 conn_id  = PT_REGS_PARM1(ctx);
+    __u64 conn_id  = nspr_resolve_conn_id(PT_REGS_PARM1(ctx));
     __u64 ts       = bpf_ktime_get_ns();
     __u8  comm[TASK_COMM_LEN];
     bpf_get_current_comm(comm, sizeof(comm));
@@ -354,6 +448,7 @@ int uprobe_ssl_writev_entry_cap(struct pt_regs *ctx)
         __builtin_memcpy(ev->comm, comm, TASK_COMM_LEN);
 
         __u32 data_len = len > MAX_SSL_DATA_SIZE ? MAX_SSL_DATA_SIZE : len;
+        data_len &= (2 * MAX_SSL_DATA_SIZE - 1);
         ev->data_len = data_len;
 
         if (bpf_probe_read_user(ev->data, data_len, (void *)base) < 0) {
@@ -364,6 +459,32 @@ int uprobe_ssl_writev_entry_cap(struct pt_regs *ctx)
         bpf_ringbuf_submit(ev, 0);
     }
 
+    return 0;
+}
+
+/* -----------------------------------------------------------------------
+ * NSS ssl_SecureRecv read probe — walks PRFileDesc->lower chain
+ *
+ * This is a variant of uprobe_ssl_read_entry specifically for NSS's
+ * ssl_SecureRecv function in libssl3.so.  It resolves the ConnID by
+ * walking fd->lower to the TCP socket (bottom of the NSPR layer stack),
+ * matching the write-side probes that also walk to the bottom.
+ *
+ * The standard uprobe_ssl_read_entry is used for OpenSSL where arg1 is
+ * an SSL* pointer (no NSPR layer stack), so it must NOT walk ->lower.
+ * --------------------------------------------------------------------- */
+
+SEC("uprobe/SSL_read_entry_nspr")
+int uprobe_ssl_read_entry_nspr(struct pt_regs *ctx)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+
+    struct ssl_args args = {
+        .buf = PT_REGS_PARM2(ctx),
+        .conn_id = nspr_resolve_conn_id(PT_REGS_PARM1(ctx)),
+        .num = (__u32)PT_REGS_PARM3(ctx),
+    };
+    bpf_map_update_elem(&active_ssl_read_args, &tid, &args, BPF_ANY);
     return 0;
 }
 

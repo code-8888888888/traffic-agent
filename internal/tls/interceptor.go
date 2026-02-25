@@ -337,7 +337,7 @@ func (i *Interceptor) attachToLibByOffset(lib sslLibFound, pid int) error {
 	}
 	if lib.readOffset != 0 {
 		probes = append(probes,
-			probeSpec{i.objs.UprobeSslReadEntry, false, lib.readOffset},
+			probeSpec{i.objs.UprobeSslReadEntryNspr, false, lib.readOffset},
 			probeSpec{i.objs.UretprobeSslReadRet, true, lib.readOffset},
 		)
 	}

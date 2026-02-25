@@ -10,10 +10,9 @@
 // RST_STREAM, GOAWAY, PUSH_PROMISE, PING, WINDOW_UPDATE.
 //
 // Limitations:
-//   - Connection key is (PID, TID, ConnID) for TLS or 4-tuple for h2c.
-//     A TLS thread that opens multiple sequential HTTP/2 connections will
-//     have its HPACK dynamic tables reset on the second connection's
-//     preface.
+//   - Connection key is (PID, ConnID) for TLS or 4-tuple for h2c.
+//     ConnID is the TCP socket fd (bottom of NSPR layer chain) for Firefox
+//     or the SSL* pointer for OpenSSL, unique per connection.
 //   - HPACK dynamic table is lost if the agent starts mid-connection.
 //     Decode errors reset the decoder so subsequent frames from new
 //     connections work.  SETTINGS_HEADER_TABLE_SIZE is tracked so
@@ -72,11 +71,14 @@ const (
 const h2FrameHeaderLen = 9
 
 // h2ConnKey identifies an HTTP/2 connection.  For TLS connections, keyed
-// by (PID, TID, ConnID).  For h2c (cleartext), keyed by normalized 4-tuple
-// with server-side in Dst.
+// by (PID, ConnID).  ConnID is the SSL-layer PRFileDesc* (for NSPR, resolved
+// via fd->lower in BPF) or the SSL* pointer (for OpenSSL), both of which
+// are unique per connection.  TID is NOT included because Firefox sends H2
+// frames from multiple threads on the same connection — the preface from
+// the Socket Thread, subsequent HEADERS from the main thread, etc.
+// For h2c (cleartext), keyed by normalized 4-tuple with server-side in Dst.
 type h2ConnKey struct {
 	PID     uint32
-	TID     uint32
 	ConnID  uint64
 	SrcIP   string
 	DstIP   string
@@ -431,8 +433,10 @@ func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID u
 	if flags&h2FlagEndHeaders != 0 {
 		// Complete header block — decode immediately.
 		s.emitFromBlock(fragment, streamID, isRead, meta, emit)
-		// END_STREAM on HEADERS: no DATA will follow (e.g. 204, 304, HEAD).
-		if endStream {
+		// END_STREAM on response HEADERS: no response body will follow (e.g. 204, 304, HEAD).
+		// Only delete on read (response) side — write (request) END_STREAM just means
+		// no request body, but we still need the stream info for correlating the response.
+		if endStream && isRead {
 			delete(s.activeStreams, streamID)
 		}
 	} else {
@@ -473,12 +477,10 @@ func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, strea
 		s.pendingWriteBlock = append(s.pendingWriteBlock, payload...)
 		if flags&h2FlagEndHeaders != 0 {
 			s.emitFromBlock(s.pendingWriteBlock, streamID, isRead, meta, emit)
-			endStream := s.pendingWriteEndStream
 			s.pendingWriteBlock = nil
 			s.pendingWriteEndStream = false
-			if endStream {
-				delete(s.activeStreams, streamID)
-			}
+			// Don't delete activeStreams on write-side END_STREAM —
+			// we still need stream info for correlating the response.
 		}
 	}
 }
@@ -556,8 +558,8 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 		}
 	}
 	if debugH2.Load() {
-		log.Printf("[h2-debug] request stream=%d method=%q path=%q host=%q nheaders=%d",
-			streamID, method, path, host, len(fields))
+		log.Printf("[h2-debug] request stream=%d method=%q path=%q host=%q nheaders=%d pid=%d",
+			streamID, method, path, host, len(fields), meta.PID)
 	}
 	if method == "" {
 		return // trailers — skip

@@ -61,6 +61,7 @@ type SSLUprobeSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type SSLUprobeProgramSpecs struct {
 	UprobeSslReadEntry      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslReadEntryNspr  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry_nspr"`
 	UprobeSslWriteEntry     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry"`
 	UprobeSslWriteEntryCap  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry_cap"`
 	UprobeSslWritevEntryCap *ebpf.ProgramSpec `ebpf:"uprobe_ssl_writev_entry_cap"`
@@ -114,6 +115,7 @@ func (m *SSLUprobeMaps) Close() error {
 // It can be passed to LoadSSLUprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SSLUprobePrograms struct {
 	UprobeSslReadEntry      *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslReadEntryNspr  *ebpf.Program `ebpf:"uprobe_ssl_read_entry_nspr"`
 	UprobeSslWriteEntry     *ebpf.Program `ebpf:"uprobe_ssl_write_entry"`
 	UprobeSslWriteEntryCap  *ebpf.Program `ebpf:"uprobe_ssl_write_entry_cap"`
 	UprobeSslWritevEntryCap *ebpf.Program `ebpf:"uprobe_ssl_writev_entry_cap"`
@@ -124,6 +126,7 @@ type SSLUprobePrograms struct {
 func (p *SSLUprobePrograms) Close() error {
 	return _SSLUprobeClose(
 		p.UprobeSslReadEntry,
+		p.UprobeSslReadEntryNspr,
 		p.UprobeSslWriteEntry,
 		p.UprobeSslWriteEntryCap,
 		p.UprobeSslWritevEntryCap,

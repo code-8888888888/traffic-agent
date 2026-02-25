@@ -157,9 +157,9 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	}
 	sslEventsReceived.Add(1)
 
-	h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
+	h2Key := h2ConnKey{PID: ev.PID, ConnID: ev.ConnID}
 
-	// Check whether this (PID, TID) is already tracked as an HTTP/2 connection.
+	// Check whether this PID+ConnID is already tracked as an HTTP/2 connection.
 	p.mu.Lock()
 	h2State := p.h2Conns[h2Key]
 	p.mu.Unlock()
@@ -200,7 +200,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 			ProcessName: ev.ProcessName,
 			Protocol:    "TLS",
 		}
-		connKey := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
+		connKey := h2ConnKey{PID: ev.PID, ConnID: ev.ConnID}
 		p.handleH2Event(h2State, ev.Data, ev.IsRead, meta, connKey)
 		return
 	}
