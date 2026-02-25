@@ -1,16 +1,15 @@
-// Package parser performs HTTP/1.1 parsing on raw packet payloads captured by
-// the TC eBPF program and on plaintext data captured by SSL uprobes.
+// Package parser performs HTTP/1.1 and HTTP/2 parsing on raw packet payloads
+// captured by the TC eBPF program and on plaintext data captured by SSL uprobes.
 //
 // Architecture:
 //
-//	RawPacketEvent  →  HandlePacket   →  per-flow buffer  →  TrafficEvent
-//	SSLEvent        →  HandleSSLEvent →  per-flow buffer  →  TrafficEvent
+//	RawPacketEvent  →  HandlePacket   →  per-flow buffer / h2c  →  TrafficEvent
+//	SSLEvent        →  HandleSSLEvent →  per-flow buffer / H2   →  TrafficEvent
 //
-// Payloads are accumulated in a per-flow (4-tuple) ring until a complete HTTP
-// message can be parsed. For responses, the event is held back until the body
-// bytes indicated by Content-Length are available (or the snippet limit is
-// reached), so the body_snippet field is populated even when the response
-// headers and body arrive in separate TCP segments.
+// HTTP/1.1 payloads are accumulated in a per-flow (4-tuple) ring until a
+// complete message can be parsed.  HTTP/2 connections (both TLS and cleartext
+// h2c) are detected from the client preface or mid-connection frame heuristics
+// and routed to a shared frame parser with per-connection HPACK decoders.
 //
 // Limitation: TCP sequence numbers are not captured by the BPF program, so
 // out-of-order segment reassembly is not supported. In-order delivery (the
@@ -72,20 +71,22 @@ type flowBuf struct {
 
 // Parser accumulates per-flow payloads and emits HTTP traffic events.
 type Parser struct {
-	sink    EventSink
-	mu      sync.Mutex
-	bufs    map[flowKey]*flowBuf
-	sslBufs map[sslFlowKey]*flowBuf
-	h2Conns map[h2ConnKey]*h2ConnState // HTTP/2 connection states keyed by (PID, TID)
+	sink     EventSink
+	mu       sync.Mutex
+	bufs     map[flowKey]*flowBuf
+	sslBufs  map[sslFlowKey]*flowBuf
+	h2Conns  map[h2ConnKey]*h2ConnState // HTTP/2 connection states keyed by (PID,TID,ConnID) or 4-tuple
+	h2cFlows map[flowKey]bool           // TC flows identified as h2c (fast lookup)
 }
 
 // New creates a Parser that will call sink for each parsed HTTP event.
 func New(sink EventSink) *Parser {
 	return &Parser{
-		sink:    sink,
-		bufs:    make(map[flowKey]*flowBuf),
-		sslBufs: make(map[sslFlowKey]*flowBuf),
-		h2Conns: make(map[h2ConnKey]*h2ConnState),
+		sink:     sink,
+		bufs:     make(map[flowKey]*flowBuf),
+		sslBufs:  make(map[sslFlowKey]*flowBuf),
+		h2Conns:  make(map[h2ConnKey]*h2ConnState),
+		h2cFlows: make(map[flowKey]bool),
 	}
 }
 
@@ -101,6 +102,15 @@ func (p *Parser) HandlePacket(ev *types.RawPacketEvent) {
 		dstIP:   ev.DstIP.String(),
 		srcPort: ev.SrcPort,
 		dstPort: ev.DstPort,
+	}
+
+	// Fast path: if this flow is already identified as h2c, route directly.
+	p.mu.Lock()
+	isH2C := p.h2cFlows[key]
+	p.mu.Unlock()
+	if isH2C {
+		p.handleH2CPacket(key, ev)
+		return
 	}
 
 	p.mu.Lock()
@@ -184,7 +194,13 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 
 	if h2State != nil {
 		sslEventsH2Routed.Add(1)
-		p.handleH2Event(h2State, ev)
+		meta := &h2EventMeta{
+			PID:         ev.PID,
+			ProcessName: ev.ProcessName,
+			Protocol:    "TLS",
+		}
+		connKey := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
+		p.handleH2Event(h2State, ev.Data, ev.IsRead, meta, connKey)
 		return
 	}
 
@@ -302,6 +318,13 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 	for key, state := range p.h2Conns {
 		if state.updated.Before(cutoff) {
 			delete(p.h2Conns, key)
+			// If this is an h2c connection (has network fields), clean up h2cFlows.
+			if key.SrcIP != "" {
+				fwd := flowKey{srcIP: key.SrcIP, dstIP: key.DstIP, srcPort: key.SrcPort, dstPort: key.DstPort}
+				rev := flowKey{srcIP: key.DstIP, dstIP: key.SrcIP, srcPort: key.DstPort, dstPort: key.SrcPort}
+				delete(p.h2cFlows, fwd)
+				delete(p.h2cFlows, rev)
+			}
 		}
 	}
 }
@@ -309,15 +332,18 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 // ---- Internal parse helpers (TC packet events) ----
 
 func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEvent) {
-	// HTTP/2 cleartext sends a connection preface starting with "PRI * HTTP/2.0".
-	// We can't parse HTTP/2 binary framing; skip silently to avoid log noise.
+	// HTTP/2 cleartext (h2c) connection preface detection.
 	if bytes.HasPrefix(data, []byte("PRI * HTTP/2.0")) {
-		p.deleteBuf(key)
+		p.initH2CConnection(key, data, ev)
 		return
 	}
 
 	fields, ok := parseHTTPRequestFields(data)
 	if !ok {
+		// HTTP/1.1 parse failed — check for mid-connection h2c frames.
+		if looksLikeH2MidConnection(data) {
+			p.initH2CMidConnection(key, data, ev)
+		}
 		return
 	}
 	te := &types.TrafficEvent{
@@ -348,6 +374,10 @@ func (p *Parser) tryParseRequest(key flowKey, data []byte, ev *types.RawPacketEv
 func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketEvent) {
 	fields, ok := parseHTTPResponseFields(data)
 	if !ok {
+		// HTTP/1.1 parse failed — check for mid-connection h2c frames.
+		if looksLikeH2MidConnection(data) {
+			p.initH2CMidConnection(key, data, ev)
+		}
 		return
 	}
 	te := &types.TrafficEvent{
@@ -371,6 +401,136 @@ func (p *Parser) tryParseResponse(key flowKey, data []byte, ev *types.RawPacketE
 		fb.lastParsedAt = time.Now()
 	}
 	p.mu.Unlock()
+}
+
+// ---- h2c (HTTP/2 cleartext) helpers ----
+
+// handleH2CPacket routes a TC packet for an already-identified h2c flow to
+// the HTTP/2 frame parser.
+func (p *Parser) handleH2CPacket(key flowKey, ev *types.RawPacketEvent) {
+	isRead := isServerPort(ev.SrcPort)
+	connKey := h2cConnKey(ev)
+
+	meta := &h2EventMeta{
+		PID:         ev.PID,
+		ProcessName: ev.ProcessName,
+		SrcIP:       connKey.SrcIP,
+		DstIP:       connKey.DstIP,
+		SrcPort:     connKey.SrcPort,
+		DstPort:     connKey.DstPort,
+		Protocol:    "TCP",
+	}
+
+	p.mu.Lock()
+	state := p.h2Conns[connKey]
+	if state == nil {
+		state = newH2ConnState()
+		p.h2Conns[connKey] = state
+	}
+	p.mu.Unlock()
+
+	p.handleH2Event(state, ev.Payload, isRead, meta, connKey)
+}
+
+// h2cConnKey builds a normalized h2ConnKey from a TC packet event with the
+// server-side address consistently in DstIP:DstPort.
+func h2cConnKey(ev *types.RawPacketEvent) h2ConnKey {
+	if isServerPort(ev.SrcPort) {
+		// Server is source — flip so server ends up in Dst.
+		return h2ConnKey{
+			SrcIP:   ev.DstIP.String(),
+			DstIP:   ev.SrcIP.String(),
+			SrcPort: ev.DstPort,
+			DstPort: ev.SrcPort,
+		}
+	}
+	return h2ConnKey{
+		SrcIP:   ev.SrcIP.String(),
+		DstIP:   ev.DstIP.String(),
+		SrcPort: ev.SrcPort,
+		DstPort: ev.DstPort,
+	}
+}
+
+// initH2CConnection initializes h2c tracking when a connection preface is detected.
+func (p *Parser) initH2CConnection(key flowKey, data []byte, ev *types.RawPacketEvent) {
+	connKey := h2cConnKey(ev)
+
+	p.mu.Lock()
+	// Mark both forward and reverse flows as h2c.
+	p.h2cFlows[key] = true
+	reverseKey := flowKey{
+		srcIP:   key.dstIP,
+		dstIP:   key.srcIP,
+		srcPort: key.dstPort,
+		dstPort: key.srcPort,
+	}
+	p.h2cFlows[reverseKey] = true
+
+	state := newH2ConnState()
+	p.h2Conns[connKey] = state
+	delete(p.bufs, key)
+	p.mu.Unlock()
+
+	h2cConnectionsDetected.Add(1)
+	log.Printf("[parser] h2c connection detected: %s:%d -> %s:%d",
+		ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+
+	// Feed the full data (including preface) to handleH2Event — the write
+	// path strips the preface automatically.
+	isRead := isServerPort(ev.SrcPort)
+	meta := &h2EventMeta{
+		PID:         ev.PID,
+		ProcessName: ev.ProcessName,
+		SrcIP:       connKey.SrcIP,
+		DstIP:       connKey.DstIP,
+		SrcPort:     connKey.SrcPort,
+		DstPort:     connKey.DstPort,
+		Protocol:    "TCP",
+	}
+	p.handleH2Event(state, data, isRead, meta, connKey)
+}
+
+// initH2CMidConnection initializes h2c tracking when mid-connection HTTP/2
+// frames are detected (agent started after the h2c connection was opened).
+func (p *Parser) initH2CMidConnection(key flowKey, data []byte, ev *types.RawPacketEvent) {
+	connKey := h2cConnKey(ev)
+
+	p.mu.Lock()
+	if _, exists := p.h2Conns[connKey]; exists {
+		p.mu.Unlock()
+		return // already tracked
+	}
+
+	p.h2cFlows[key] = true
+	reverseKey := flowKey{
+		srcIP:   key.dstIP,
+		dstIP:   key.srcIP,
+		srcPort: key.dstPort,
+		dstPort: key.srcPort,
+	}
+	p.h2cFlows[reverseKey] = true
+
+	state := newH2ConnState()
+	p.h2Conns[connKey] = state
+	delete(p.bufs, key)
+	p.mu.Unlock()
+
+	h2cConnectionsDetected.Add(1)
+	log.Printf("[parser] h2c mid-connection detected: %s:%d -> %s:%d (frame type=0x%02x)",
+		ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort, data[3])
+
+	isRead := isServerPort(ev.SrcPort)
+	meta := &h2EventMeta{
+		PID:         ev.PID,
+		ProcessName: ev.ProcessName,
+		SrcIP:       connKey.SrcIP,
+		DstIP:       connKey.DstIP,
+		SrcPort:     connKey.SrcPort,
+		DstPort:     connKey.DstPort,
+		Protocol:    "TCP",
+	}
+	p.handleH2Event(state, data, isRead, meta, connKey)
 }
 
 func (p *Parser) deleteBuf(key flowKey) {

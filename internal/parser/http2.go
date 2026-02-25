@@ -1,20 +1,22 @@
-// Package parser — HTTP/2 support.
+// Package parser — HTTP/2 support for both TLS (SSL uprobe) and cleartext (h2c via TC).
 //
 // HTTP/2 connections are detected from the client connection preface
-// ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") seen in SSL_write data.  Once a
-// connection is marked as HTTP/2, all subsequent SSL events for the same
-// (PID, TID) are decoded using a per-connection HPACK decoder rather than
-// the HTTP/1.1 path.
+// ("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n") seen in SSL_write data or TC
+// packets.  Once a connection is marked as HTTP/2, all subsequent events
+// for the same connection key are decoded using a per-connection HPACK
+// decoder rather than the HTTP/1.1 path.
+//
+// Supported frame types: HEADERS, CONTINUATION, DATA, SETTINGS,
+// RST_STREAM, GOAWAY, PUSH_PROMISE, PING, WINDOW_UPDATE.
 //
 // Limitations:
-//   - Connection key is (PID, TID).  A thread that opens multiple sequential
-//     HTTP/2 connections will have its HPACK dynamic tables reset on the second
-//     connection's preface.  Concurrent connections on the same thread are not
-//     distinguishable without tracking the file descriptor.
-//   - HPACK dynamic table is lost if the agent starts mid-connection.  Decode
-//     errors reset the decoder so subsequent frames from new connections work.
-//   - Response body snippets are not captured for HTTP/2 (DATA frames contain
-//     no headers; correlating them with a stream requires more state).
+//   - Connection key is (PID, TID, ConnID) for TLS or 4-tuple for h2c.
+//     A TLS thread that opens multiple sequential HTTP/2 connections will
+//     have its HPACK dynamic tables reset on the second connection's
+//     preface.
+//   - HPACK dynamic table is lost if the agent starts mid-connection.
+//     Decode errors reset the decoder so subsequent frames from new
+//     connections work.
 package parser
 
 import (
@@ -23,6 +25,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2/hpack"
@@ -38,14 +41,19 @@ const h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 const (
 	h2FrameData         = byte(0x0)
 	h2FrameHeaders      = byte(0x1)
+	h2FramePriority     = byte(0x2)
+	h2FrameRSTStream    = byte(0x3)
 	h2FrameSettings     = byte(0x4)
+	h2FramePushPromise  = byte(0x5)
 	h2FramePing         = byte(0x6)
+	h2FrameGoaway       = byte(0x7)
 	h2FrameWindowUpdate = byte(0x8)
 	h2FrameContinuation = byte(0x9)
 )
 
 // HTTP/2 HEADERS frame flags.
 const (
+	h2FlagEndStream  = byte(0x1)
 	h2FlagEndHeaders = byte(0x4)
 	h2FlagPadded     = byte(0x8)
 	h2FlagPriority   = byte(0x20)
@@ -54,21 +62,38 @@ const (
 // h2FrameHeaderLen is the fixed 9-byte length of every HTTP/2 frame header.
 const h2FrameHeaderLen = 9
 
-// h2ConnKey identifies an HTTP/2 connection by the PID, TID, and ConnID
-// (the SSL*/PRFileDesc* pointer captured by the BPF uprobe).  ConnID
-// disambiguates multiple connections multiplexed on the same thread (e.g.
-// Firefox's Socket Thread handles ALL H2 connections).
+// h2ConnKey identifies an HTTP/2 connection.  For TLS connections, keyed
+// by (PID, TID, ConnID).  For h2c (cleartext), keyed by normalized 4-tuple
+// with server-side in Dst.
 type h2ConnKey struct {
-	PID    uint32
-	TID    uint32
-	ConnID uint64
+	PID     uint32
+	TID     uint32
+	ConnID  uint64
+	SrcIP   string
+	DstIP   string
+	SrcPort uint16
+	DstPort uint16
+}
+
+// h2EventMeta carries per-event metadata that is threaded through all frame
+// processing methods.  It abstracts over TLS vs h2c data sources.
+type h2EventMeta struct {
+	PID         uint32
+	ProcessName string
+	SrcIP       string
+	DstIP       string
+	SrcPort     uint16
+	DstPort     uint16
+	Protocol    string // "TCP" for h2c, "TLS" for SSL path
 }
 
 // h2StreamInfo tracks a request's metadata for correlating DATA frames.
 type h2StreamInfo struct {
-	method string
-	path   string
-	host   string
+	method          string
+	path            string
+	host            string
+	statusCode      int    // from response HEADERS
+	contentEncoding string // for gzip decompression
 }
 
 // h2ConnState holds per-connection HTTP/2 decode state.
@@ -86,13 +111,18 @@ type h2ConnState struct {
 	readBuf  []byte
 
 	// State for HEADERS + CONTINUATION frame sequences (one in-flight at a time).
-	pendingWriteBlock  []byte
-	pendingWriteStream uint32
-	pendingReadBlock   []byte
-	pendingReadStream  uint32
+	pendingWriteBlock     []byte
+	pendingWriteStream    uint32
+	pendingWriteEndStream bool // END_STREAM was on the HEADERS frame
+	pendingReadBlock      []byte
+	pendingReadStream     uint32
+	pendingReadEndStream  bool // END_STREAM was on the HEADERS frame
 
-	// Active streams: maps stream ID → request info for DATA frame correlation.
+	// Active streams: maps stream ID -> request info for DATA frame correlation.
 	activeStreams map[uint32]*h2StreamInfo
+
+	// SETTINGS_MAX_FRAME_SIZE (default 16384, max 16777215).
+	maxFrameSize int
 
 	// Corruption tracking.  NSPR's PR_Write fires for ALL I/O, not just TLS.
 	// Non-HTTP/2 data that sneaks through can corrupt frame parsing.  If too
@@ -105,10 +135,11 @@ type h2ConnState struct {
 
 func newH2ConnState() *h2ConnState {
 	return &h2ConnState{
-		writeDecoder:  hpack.NewDecoder(4096, nil),
-		readDecoder:   hpack.NewDecoder(4096, nil),
+		writeDecoder: hpack.NewDecoder(4096, nil),
+		readDecoder:  hpack.NewDecoder(4096, nil),
 		activeStreams: make(map[uint32]*h2StreamInfo),
-		updated:       time.Now(),
+		maxFrameSize: 16384,
+		updated:      time.Now(),
 	}
 }
 
@@ -126,7 +157,7 @@ func isHTTP2Preface(data []byte) bool {
 //   - HEADERS: requires valid stream ID (odd for write, non-zero)
 //   - SETTINGS: requires stream ID 0 and length divisible by 6
 //   - DATA: requires valid stream ID (non-zero)
-//   - All: frame length must be ≤ 16384 (default SETTINGS_MAX_FRAME_SIZE)
+//   - All: frame length must be <= 16384 (default SETTINGS_MAX_FRAME_SIZE)
 //
 // The false-positive rate on random binary data is negligible compared to the
 // old heuristic, because we require specific frame-type semantics.
@@ -145,13 +176,13 @@ func looksLikeH2MidConnection(data []byte) bool {
 
 	switch frameType {
 	case h2FrameHeaders: // 0x01
-		// HEADERS: stream ID must be > 0, length ≥ 2 (at least a tiny HPACK block).
+		// HEADERS: stream ID must be > 0, length >= 2 (at least a tiny HPACK block).
 		return streamID > 0 && frameLen >= 2
 	case h2FrameSettings: // 0x04
 		// SETTINGS: stream ID must be 0, length divisible by 6 (each setting is 6 bytes).
 		return streamID == 0 && frameLen%6 == 0
 	case h2FrameData: // 0x00
-		// DATA: stream ID must be > 0, and length ≥ 1.
+		// DATA: stream ID must be > 0, and length >= 1.
 		return streamID > 0 && frameLen >= 1
 	case h2FramePing: // 0x06
 		// PING: fixed 8-byte payload, always on stream 0.
@@ -168,21 +199,32 @@ func looksLikeH2MidConnection(data []byte) bool {
 // case where non-TLS PR_Write data leaks into the HTTP/2 buffer.
 const maxH2ConsecutiveErrors = 5
 
-// handleH2Event appends ev.Data to the connection's direction buffer and
+// h2c stats counters.
+var (
+	h2cConnectionsDetected atomic.Int64
+	h2cFramesParsed        atomic.Int64
+)
+
+// H2CStats returns snapshot counters for h2c connections and frames.
+func H2CStats() (connections, frames int64) {
+	return h2cConnectionsDetected.Load(), h2cFramesParsed.Load()
+}
+
+// handleH2Event appends data to the connection's direction buffer and
 // parses as many complete HTTP/2 frames as possible, calling p.sink for
 // each decoded request or response event.
-func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
+func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, meta *h2EventMeta, connKey h2ConnKey) {
 	var pending []*types.TrafficEvent
 
 	p.mu.Lock()
 	state.updated = time.Now()
 
-	if !ev.IsRead {
-		// Outgoing (SSL_write): browser → server.
-		data := ev.Data
-		if isHTTP2Preface(data) {
-			data = data[len(h2ClientPreface):]
-			// New connection on this (PID, TID) — reset all state.
+	if !isRead {
+		// Outgoing: browser -> server.
+		d := data
+		if isHTTP2Preface(d) {
+			d = d[len(h2ClientPreface):]
+			// New connection on this key — reset all state.
 			// Firefox's Socket Thread handles ALL H2 connections, so
 			// navigating to a new domain sends a new preface on the
 			// same thread.  Stale HPACK tables and activeStreams from
@@ -196,9 +238,12 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 			state.pendingReadBlock = nil
 			state.pendingWriteStream = 0
 			state.pendingReadStream = 0
+			state.pendingWriteEndStream = false
+			state.pendingReadEndStream = false
 			state.consecutiveErrors = 0
+			state.maxFrameSize = 16384
 		}
-		if len(data) == 0 {
+		if len(d) == 0 {
 			p.mu.Unlock()
 			return
 		}
@@ -206,30 +251,30 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 		// When the write buffer is empty we are NOT in the middle of a
 		// partial frame.  Validate that new data looks like HTTP/2 frames
 		// to filter out non-TLS PR_Write noise (IPC, files, etc.).
-		if len(state.writeBuf) == 0 && !isValidH2FrameStart(data) {
+		if len(state.writeBuf) == 0 && !isValidH2FrameStart(d) {
 			p.mu.Unlock()
 			return
 		}
 
-		if len(state.writeBuf)+len(data) <= maxFlowBufSize {
-			state.writeBuf = append(state.writeBuf, data...)
+		if len(state.writeBuf)+len(d) <= maxFlowBufSize {
+			state.writeBuf = append(state.writeBuf, d...)
 		}
-		n := state.parseH2Frames(state.writeBuf, false, ev.PID, ev.ProcessName,
+		n := state.parseH2Frames(state.writeBuf, false, meta,
 			func(te *types.TrafficEvent) { pending = append(pending, te) })
 		if n > 0 {
 			state.writeBuf = state.writeBuf[n:]
 		}
 	} else {
-		// Incoming (SSL_read): server → browser.
-		if len(state.readBuf) == 0 && !isValidH2FrameStart(ev.Data) {
+		// Incoming: server -> browser.
+		if len(state.readBuf) == 0 && !isValidH2FrameStart(data) {
 			p.mu.Unlock()
 			return
 		}
 
-		if len(state.readBuf)+len(ev.Data) <= maxFlowBufSize {
-			state.readBuf = append(state.readBuf, ev.Data...)
+		if len(state.readBuf)+len(data) <= maxFlowBufSize {
+			state.readBuf = append(state.readBuf, data...)
 		}
-		n := state.parseH2Frames(state.readBuf, true, ev.PID, ev.ProcessName,
+		n := state.parseH2Frames(state.readBuf, true, meta,
 			func(te *types.TrafficEvent) { pending = append(pending, te) })
 		if n > 0 {
 			state.readBuf = state.readBuf[n:]
@@ -239,8 +284,7 @@ func (p *Parser) handleH2Event(state *h2ConnState, ev *types.SSLEvent) {
 	// If too many consecutive errors, the state is corrupt.
 	// Delete it so a fresh preface can re-create a clean state.
 	if state.consecutiveErrors >= maxH2ConsecutiveErrors {
-		h2Key := h2ConnKey{PID: ev.PID, TID: ev.TID, ConnID: ev.ConnID}
-		delete(p.h2Conns, h2Key)
+		delete(p.h2Conns, connKey)
 	}
 
 	p.mu.Unlock()
@@ -258,7 +302,7 @@ func isValidH2FrameStart(data []byte) bool {
 		return false
 	}
 	frameType := data[3]
-	if frameType > 0x09 { // HTTP/2 defines frame types 0x0 – 0x9
+	if frameType > 0x09 { // HTTP/2 defines frame types 0x0 - 0x9
 		return false
 	}
 	frameLen := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
@@ -273,7 +317,7 @@ func isValidH2FrameStart(data []byte) bool {
 // parseH2Frames consumes as many complete HTTP/2 frames as possible from data
 // and calls emit for any request or response events decoded from HEADERS frames.
 // Returns the number of bytes consumed.
-func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) int {
+func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) int {
 	consumed := 0
 	for len(data) >= h2FrameHeaderLen {
 		frameLen := int(data[0])<<16 | int(data[1])<<8 | int(data[2])
@@ -297,11 +341,23 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm s
 		payload := data[h2FrameHeaderLen:total]
 		switch frameType {
 		case h2FrameHeaders:
-			s.processHeadersFrame(payload, flags, streamID, isRead, pid, comm, emit)
+			s.processHeadersFrame(payload, flags, streamID, isRead, meta, emit)
 		case h2FrameContinuation:
-			s.processContinuationFrame(payload, flags, streamID, isRead, pid, comm, emit)
+			s.processContinuationFrame(payload, flags, streamID, isRead, meta, emit)
 		case h2FrameData:
-			s.processDataFrame(payload, flags, streamID, isRead, pid, comm, emit)
+			s.processDataFrame(payload, flags, streamID, isRead, meta, emit)
+		case h2FrameRSTStream:
+			s.processRSTStream(streamID)
+		case h2FrameSettings:
+			s.processSettings(payload, flags)
+		case h2FrameGoaway:
+			s.processGoaway(payload)
+		case h2FramePushPromise:
+			// Server push is deprecated in most browsers; just consume the frame.
+		}
+
+		if meta.Protocol == "TCP" {
+			h2cFramesParsed.Add(1)
 		}
 
 		// Valid frame consumed — reset error counter.
@@ -313,7 +369,7 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, pid uint32, comm s
 	return consumed
 }
 
-func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID uint32, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	fragment := payload
 
 	// Strip padding if PADDED flag is set.
@@ -337,9 +393,15 @@ func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID u
 		fragment = fragment[5:]
 	}
 
+	endStream := flags&h2FlagEndStream != 0
+
 	if flags&h2FlagEndHeaders != 0 {
 		// Complete header block — decode immediately.
-		s.emitFromBlock(fragment, streamID, isRead, pid, comm, emit)
+		s.emitFromBlock(fragment, streamID, isRead, meta, emit)
+		// END_STREAM on HEADERS: no DATA will follow (e.g. 204, 304, HEAD).
+		if endStream {
+			delete(s.activeStreams, streamID)
+		}
 	} else {
 		// Partial — accumulate block for following CONTINUATION frames.
 		block := make([]byte, len(fragment))
@@ -347,22 +409,29 @@ func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID u
 		if isRead {
 			s.pendingReadBlock = block
 			s.pendingReadStream = streamID
+			s.pendingReadEndStream = endStream
 		} else {
 			s.pendingWriteBlock = block
 			s.pendingWriteStream = streamID
+			s.pendingWriteEndStream = endStream
 		}
 	}
 }
 
-func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, streamID uint32, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	if isRead {
 		if s.pendingReadBlock == nil || s.pendingReadStream != streamID {
 			return
 		}
 		s.pendingReadBlock = append(s.pendingReadBlock, payload...)
 		if flags&h2FlagEndHeaders != 0 {
-			s.emitFromBlock(s.pendingReadBlock, streamID, isRead, pid, comm, emit)
+			s.emitFromBlock(s.pendingReadBlock, streamID, isRead, meta, emit)
+			endStream := s.pendingReadEndStream
 			s.pendingReadBlock = nil
+			s.pendingReadEndStream = false
+			if endStream {
+				delete(s.activeStreams, streamID)
+			}
 		}
 	} else {
 		if s.pendingWriteBlock == nil || s.pendingWriteStream != streamID {
@@ -370,14 +439,19 @@ func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, strea
 		}
 		s.pendingWriteBlock = append(s.pendingWriteBlock, payload...)
 		if flags&h2FlagEndHeaders != 0 {
-			s.emitFromBlock(s.pendingWriteBlock, streamID, isRead, pid, comm, emit)
+			s.emitFromBlock(s.pendingWriteBlock, streamID, isRead, meta, emit)
+			endStream := s.pendingWriteEndStream
 			s.pendingWriteBlock = nil
+			s.pendingWriteEndStream = false
+			if endStream {
+				delete(s.activeStreams, streamID)
+			}
 		}
 	}
 }
 
 // emitFromBlock HPACK-decodes a complete header block and emits a TrafficEvent.
-func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	dec := s.writeDecoder
 	if isRead {
 		dec = s.readDecoder
@@ -421,13 +495,13 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 	}
 
 	if isRead {
-		s.buildResponseEvent(fields, pid, comm, emit)
+		s.buildResponseEvent(fields, streamID, meta, emit)
 	} else {
-		s.buildRequestEvent(fields, streamID, pid, comm, emit)
+		s.buildRequestEvent(fields, streamID, meta, emit)
 	}
 }
 
-func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uint32, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uint32, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	method, path, host := "", "", ""
 	headers := make(map[string]string)
 	for _, f := range fields {
@@ -472,47 +546,67 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 
 	emit(&types.TrafficEvent{
 		Timestamp:      time.Now(),
-		Protocol:       "TLS",
+		SrcIP:          meta.SrcIP,
+		DstIP:          meta.DstIP,
+		SrcPort:        meta.SrcPort,
+		DstPort:        meta.DstPort,
+		Protocol:       meta.Protocol,
 		Direction:      "egress",
-		PID:            pid,
-		ProcessName:    comm,
+		PID:            meta.PID,
+		ProcessName:    meta.ProcessName,
 		HTTPMethod:     method,
 		URL:            path,
 		RequestHeaders: headers,
-		TLSIntercepted: true,
+		TLSIntercepted: meta.Protocol == "TLS",
 	})
 }
 
-func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, streamID uint32, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	statusCode := 0
+	contentEncoding := ""
 	headers := make(map[string]string)
 	for _, f := range fields {
 		if f.Name == ":status" {
 			statusCode, _ = strconv.Atoi(f.Value)
 		} else if !strings.HasPrefix(f.Name, ":") {
 			headers[http.CanonicalHeaderKey(f.Name)] = f.Value
+			if strings.EqualFold(f.Name, "content-encoding") {
+				contentEncoding = f.Value
+			}
 		}
 	}
 	if statusCode == 0 {
 		return // trailers
 	}
+
+	// Save response metadata in activeStreams for DATA frame enrichment.
+	if info := s.activeStreams[streamID]; info != nil {
+		info.statusCode = statusCode
+		info.contentEncoding = contentEncoding
+	}
+
 	emit(&types.TrafficEvent{
 		Timestamp:       time.Now(),
-		Protocol:        "TLS",
+		SrcIP:           meta.SrcIP,
+		DstIP:           meta.DstIP,
+		SrcPort:         meta.SrcPort,
+		DstPort:         meta.DstPort,
+		Protocol:        meta.Protocol,
 		Direction:       "ingress",
-		PID:             pid,
-		ProcessName:     comm,
+		PID:             meta.PID,
+		ProcessName:     meta.ProcessName,
 		StatusCode:      statusCode,
 		ResponseHeaders: headers,
-		TLSIntercepted:  true,
+		TLSIntercepted:  meta.Protocol == "TLS",
 	})
 }
 
 // processDataFrame extracts a body snippet from an HTTP/2 DATA frame and
 // emits a TrafficEvent correlated with the stream's HEADERS metadata.
 // For write (egress) frames, it looks up the request info from activeStreams.
-// For read (ingress) frames, it emits the body with direction=ingress.
-func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint32, isRead bool, pid uint32, comm string, emit func(*types.TrafficEvent)) {
+// For read (ingress) frames, it enriches the event with response metadata
+// (status code, URL) from the stream's HEADERS if available.
+func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint32, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	if len(payload) == 0 {
 		return
 	}
@@ -546,18 +640,23 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		reqBody = reqBody[:types.RequestBodyMaxLen]
 	}
 
+	info := s.activeStreams[streamID]
+
 	if !isRead {
 		// Egress DATA: look up the request's HEADERS metadata.
-		info := s.activeStreams[streamID]
 		te := &types.TrafficEvent{
 			Timestamp:      time.Now(),
-			Protocol:       "TLS",
+			SrcIP:          meta.SrcIP,
+			DstIP:          meta.DstIP,
+			SrcPort:        meta.SrcPort,
+			DstPort:        meta.DstPort,
+			Protocol:       meta.Protocol,
 			Direction:      "egress",
-			PID:            pid,
-			ProcessName:    comm,
+			PID:            meta.PID,
+			ProcessName:    meta.ProcessName,
 			BodySnippet:    string(snippet),
 			RequestBody:    string(reqBody),
-			TLSIntercepted: true,
+			TLSIntercepted: meta.Protocol == "TLS",
 		}
 		if info != nil {
 			te.HTTPMethod = info.method
@@ -568,20 +667,75 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		}
 		emit(te)
 	} else {
-		// Ingress DATA: emit body snippet for response.
-		emit(&types.TrafficEvent{
+		// Ingress DATA: enrich with response metadata from HEADERS.
+		snippetStr := string(snippet)
+		if info != nil && strings.EqualFold(info.contentEncoding, "gzip") {
+			snippetStr = decompressGzip(snippet)
+		}
+
+		te := &types.TrafficEvent{
 			Timestamp:      time.Now(),
-			Protocol:       "TLS",
+			SrcIP:          meta.SrcIP,
+			DstIP:          meta.DstIP,
+			SrcPort:        meta.SrcPort,
+			DstPort:        meta.DstPort,
+			Protocol:       meta.Protocol,
 			Direction:      "ingress",
-			PID:            pid,
-			ProcessName:    comm,
-			BodySnippet:    string(snippet),
-			TLSIntercepted: true,
-		})
+			PID:            meta.PID,
+			ProcessName:    meta.ProcessName,
+			BodySnippet:    snippetStr,
+			TLSIntercepted: meta.Protocol == "TLS",
+		}
+		if info != nil {
+			te.StatusCode = info.statusCode
+			te.URL = info.path
+			te.HTTPMethod = info.method
+		}
+		emit(te)
 	}
 
 	// Clean up stream after END_STREAM flag (0x01).
-	if flags&0x01 != 0 {
+	if flags&h2FlagEndStream != 0 {
 		delete(s.activeStreams, streamID)
+	}
+}
+
+// processRSTStream handles RST_STREAM frames by cleaning up the stream entry.
+func (s *h2ConnState) processRSTStream(streamID uint32) {
+	delete(s.activeStreams, streamID)
+}
+
+// processSettings handles SETTINGS frames.  Tracks SETTINGS_MAX_FRAME_SIZE
+// and skips ACK frames (flag 0x01, empty payload).
+func (s *h2ConnState) processSettings(payload []byte, flags byte) {
+	// ACK frame: flag 0x01, must have empty payload.
+	if flags&0x01 != 0 {
+		return
+	}
+	// Parse 6-byte setting pairs: 2-byte ID + 4-byte value.
+	for len(payload) >= 6 {
+		settingID := binary.BigEndian.Uint16(payload[0:2])
+		settingVal := binary.BigEndian.Uint32(payload[2:6])
+		payload = payload[6:]
+
+		// SETTINGS_MAX_FRAME_SIZE (0x5).
+		if settingID == 0x5 {
+			if settingVal >= 16384 && settingVal <= 16777215 {
+				s.maxFrameSize = int(settingVal)
+			}
+		}
+	}
+}
+
+// processGoaway handles GOAWAY frames by cleaning up streams beyond lastStreamID.
+func (s *h2ConnState) processGoaway(payload []byte) {
+	if len(payload) < 8 {
+		return
+	}
+	lastStreamID := binary.BigEndian.Uint32(payload[0:4]) & 0x7FFFFFFF
+	for id := range s.activeStreams {
+		if id > lastStreamID {
+			delete(s.activeStreams, id)
+		}
 	}
 }

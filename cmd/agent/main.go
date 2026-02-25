@@ -159,6 +159,10 @@ func main() {
 					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d chan_len=%d",
 						rx, h2p, h2r, h1, skip, sslDrops, len(sslEventCh))
 				}
+				h2cConns, h2cFrames := parser.H2CStats()
+				if h2cConns > 0 || h2cFrames > 0 {
+					log.Printf("[stats] h2c: connections=%d frames=%d", h2cConns, h2cFrames)
+				}
 			}
 		}()
 	}
