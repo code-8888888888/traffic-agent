@@ -48,6 +48,10 @@ var knownSSLLibDefs = []sslLibDef{
 	// PR_Write and PR_Read are 3-instruction indirect tail-calls on ARM64;
 	// uretprobes will never fire.  Use entry-only write capture instead.
 	{namePattern: "libnspr4.so", writeFunc: "PR_Write", readFunc: "PR_Read", tailCall: true},
+	// PR_Send/PR_Recv — socket-specific NSPR I/O used by Firefox's HTTP/2 stack.
+	// Same ABI as PR_Write/PR_Read (fd, buf, len as first 3 params), same tail-call.
+	// Firefox uses PR_Send for H2 frame writes, PR_Write for H1 and IPC.
+	{namePattern: "libnspr4.so", writeFunc: "PR_Send", readFunc: "PR_Recv", tailCall: true},
 }
 
 // sslLibFound holds a resolved shared-library path and the function names to
@@ -116,18 +120,26 @@ func findSSLLibsForPID(pid int) []sslLibFound {
 	}
 
 	// Second pass: add standard SSL libraries (including libnspr4.so for
-	// outgoing plaintext via PR_Write entry-only capture).
+	// outgoing plaintext via PR_Write and PR_Send entry-only capture).
 	for _, libPath := range libPaths {
 		base := filepath.Base(libPath)
+		matched := ""
 		for _, def := range knownSSLLibDefs {
 			if strings.Contains(base, def.namePattern) {
+				// Prevent double-match: if a different pattern already matched
+				// this library, skip (e.g. "libssl.so" matching "libboringssl.so").
+				// But allow the same pattern to match multiple times (e.g. two
+				// libnspr4.so entries for PR_Write and PR_Send).
+				if matched != "" && matched != def.namePattern {
+					continue
+				}
+				matched = def.namePattern
 				found = append(found, sslLibFound{
 					path:      libPath,
 					writeFunc: def.writeFunc,
 					readFunc:  def.readFunc,
 					tailCall:  def.tailCall,
 				})
-				break
 			}
 		}
 	}

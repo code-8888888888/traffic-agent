@@ -39,6 +39,7 @@ var (
 	sslEventsH2Routed  atomic.Int64
 	sslEventsH1Path    atomic.Int64
 	sslEventsSkipped   atomic.Int64
+
 )
 
 const maxFlowBufSize = 256 * 1024 // 256 KB max accumulated per flow

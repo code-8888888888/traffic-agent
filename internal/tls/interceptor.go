@@ -240,12 +240,15 @@ func (i *Interceptor) attachGlobal() error {
 
 		// Scan shared libraries loaded by this process.
 		for _, lib := range findSSLLibsForPID(pid) {
-			// For offset-based libs (NSS libssl3.so), use a unique key that
-			// includes the offset so it doesn't conflict with the symbol-based
-			// attachment of the same path.
+			// Build a unique attach key per (path, function) combination.
+			// Offset-based libs include the offset; symbol-based libs include
+			// the write function name so multiple hooks on the same library
+			// (e.g. PR_Write + PR_Send on libnspr4.so) are not deduplicated.
 			attachKey := lib.path
 			if lib.readOffset != 0 {
 				attachKey = fmt.Sprintf("%s@read=0x%x", lib.path, lib.readOffset)
+			} else if lib.writeFunc != "" {
+				attachKey = fmt.Sprintf("%s@%s", lib.path, lib.writeFunc)
 			}
 			i.mu.Lock()
 			seen := i.attachedLibs[attachKey]
