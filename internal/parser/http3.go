@@ -349,16 +349,15 @@ func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, isServer b
 
 	info := state.activeStreams[streamID]
 
-	// Skip DATA frames with no corresponding HEADERS — these produce
-	// noise events with empty method/URL (e.g., from streams where we
-	// missed the initial HEADERS or from control stream data).
-	if info == nil {
-		return
-	}
-
 	snippet := payload
 	if len(snippet) > types.BodySnippetMaxLen {
 		snippet = snippet[:types.BodySnippetMaxLen]
+	}
+
+	// Full request body (up to RequestBodyMaxLen).
+	reqBody := payload
+	if len(reqBody) > types.RequestBodyMaxLen {
+		reqBody = reqBody[:types.RequestBodyMaxLen]
 	}
 
 	snippetStr := string(snippet)
@@ -376,7 +375,7 @@ func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, isServer b
 		direction = "ingress"
 	}
 
-	emit(&types.TrafficEvent{
+	te := &types.TrafficEvent{
 		Timestamp:      time.Now(),
 		SrcIP:          evSrcIP,
 		DstIP:          evDstIP,
@@ -386,12 +385,18 @@ func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, isServer b
 		Direction:      direction,
 		PID:            pid,
 		ProcessName:    processName,
-		HTTPMethod:     info.method,
-		URL:            info.path,
-		StatusCode:     info.statusCode,
 		BodySnippet:    snippetStr,
 		TLSIntercepted: true,
-	})
+	}
+	if !isServer {
+		te.RequestBody = string(reqBody)
+	}
+	if info != nil {
+		te.HTTPMethod = info.method
+		te.URL = info.path
+		te.StatusCode = info.statusCode
+	}
+	emit(te)
 }
 
 // FlushExpired removes stale H3 connection states.

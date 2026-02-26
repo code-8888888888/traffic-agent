@@ -211,18 +211,18 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
      * 1. tmp = raw_len - 1  →  wraps to UINT32_MAX when raw_len == 0.
      * 2. "if (tmp > (MAX_PAYLOAD_SIZE-2))" emits unsigned JGT on tmp
      *    directly (opcode 0x25).  Catches both:
-     *      raw_len == 0   → tmp = UINT32_MAX > 2046 → taken (discard)
-     *      raw_len > 2047 → tmp > 2046              → taken (clamp)
-     * 3. JGT NOT-taken path: tmp.umax = MAX_PAYLOAD_SIZE-2 = 2046.
+     *      raw_len == 0   → tmp = UINT32_MAX > (MAX_PAYLOAD_SIZE-2) → taken (discard)
+     *      raw_len > MAX_PAYLOAD_SIZE-1 → tmp > MAX_PAYLOAD_SIZE-2 → taken (clamp)
+     * 3. JGT NOT-taken path: tmp.umax = MAX_PAYLOAD_SIZE-2.
      * 4. payload_len = tmp + 1:
      *      umin = tmp.umin + 1 = 0 + 1 = 1  ✓
-     *      umax = tmp.umax + 1 = 2046 + 1 = 2047  ✓
+     *      umax = tmp.umax + 1 = MAX_PAYLOAD_SIZE-1  ✓
      *
      * In the JGT taken path:
      *   raw_len == 0   → discard and return (no PHI contribution)
-     *   raw_len > 2047 → tmp = 2046 (constant) → payload_len = 2047
+     *   raw_len > MAX_PAYLOAD_SIZE-1 → tmp = MAX_PAYLOAD_SIZE-2 → payload_len = MAX_PAYLOAD_SIZE-1
      *
-     * PHI merge: both surviving contributors have tmp.umax = 2046,
+     * PHI merge: both surviving contributors have tmp.umax = MAX_PAYLOAD_SIZE-2,
      * so bpf_skb_load_bytes receives payload_len with umin = 1. */
     __u32 raw_len = skb->len - payload_off;
     __u32 tmp     = raw_len - 1;  /* wraps to UINT32_MAX if raw_len == 0 */
@@ -239,7 +239,7 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     }
 
     /* tmp ∈ [0, MAX_PAYLOAD_SIZE-2] from both surviving paths.
-     * Verifier: tmp.umax = 2046 → payload_len = tmp+1: umin=1, umax=2047. */
+     * Verifier: tmp.umax = MAX_PAYLOAD_SIZE-2 → payload_len = tmp+1: umin=1, umax=MAX_PAYLOAD_SIZE-1. */
     __u32 payload_len = tmp + 1;
 
     ev->payload_len = payload_len;

@@ -12,7 +12,6 @@ package quic
 
 import (
 	"encoding/hex"
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -31,6 +30,10 @@ var (
 	QUICH3EventsEmitted    atomic.Int64
 	QUICReverseMisses      atomic.Int64
 	QUICLongHeaderSkipped  atomic.Int64
+	QUICKeyUpdates         atomic.Int64
+	QUICKeyUpdateAttempts  atomic.Int64
+	QUICKeyUpdateNoSecret  atomic.Int64
+	QUICGROSplits          atomic.Int64
 )
 
 // QUICStats returns a snapshot of QUIC processing statistics.
@@ -59,6 +62,15 @@ type connState struct {
 	serverPort uint16
 	streams    *streamAssembler
 	updated    time.Time
+	// Largest successfully decrypted packet number per direction.
+	// Used for PN reconstruction (RFC 9000 §A). -1 means unknown.
+	largestClientPN int64
+	largestServerPN int64
+	// Raw traffic secrets for key update derivation (RFC 9001 §6).
+	clientSecret []byte
+	serverSecret []byte
+	hashType     uint32 // for cipher suite + hash function lookup
+	keyGeneration int   // current key generation (0 = initial)
 }
 
 // Processor manages QUIC connections and decrypts packets.
@@ -79,10 +91,20 @@ type bufferedPacket struct {
 }
 
 type pendingKeySet struct {
-	pid       uint32
-	keys      *tlspkg.ConnectionKeys
-	created   time.Time
-	matched   bool
+	pid     uint32
+	keys    *tlspkg.ConnectionKeys
+	created time.Time
+	matched bool
+	// Pre-built direction keys for each cipher suite candidate.
+	// SHA-256 secrets could be AES-128-GCM or ChaCha20-Poly1305,
+	// so we store both and try each during matching.
+	candidates []pendingCandidate
+}
+
+type pendingCandidate struct {
+	suite      cipherSuite
+	clientKeys *directionKeys
+	serverKeys *directionKeys
 }
 
 // NewProcessor creates a QUIC processor.
@@ -99,38 +121,72 @@ func (p *Processor) RegisterKeys(pid uint32, keys *tlspkg.ConnectionKeys) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	suite := cipherSuiteFromHashType(keys.HashType)
+	// Build candidate cipher suites. SHA-256 (32-byte) secrets could be
+	// AES-128-GCM (16-byte key) or ChaCha20-Poly1305 (32-byte key).
+	// We derive separate keys for each cipher suite from the raw secrets.
+	var candidates []pendingCandidate
+	suites := cipherSuiteCandidates(keys.HashType)
+	for _, suite := range suites {
+		keyLen := keyLenForSuite(suite)
+		hashFunc := hashFuncForType(keys.HashType)
 
-	clientKeys, err := buildDirectionKeys(keys.ClientKey, keys.ClientIV, keys.ClientHP, suite)
-	if err != nil {
-		log.Printf("[quic] failed to build client keys: %v", err)
-		return
+		ck, sk, err := deriveDirectionKeysFromSecrets(keys.ClientSecret, keys.ServerSecret, hashFunc, keyLen, suite)
+		if err != nil {
+			continue
+		}
+		candidates = append(candidates, pendingCandidate{
+			suite:      suite,
+			clientKeys: ck,
+			serverKeys: sk,
+		})
 	}
-	serverKeys, err := buildDirectionKeys(keys.ServerKey, keys.ServerIV, keys.ServerHP, suite)
-	if err != nil {
-		log.Printf("[quic] failed to build server keys: %v", err)
+	if len(candidates) == 0 {
 		return
 	}
 
 	pk := &pendingKeySet{
-		pid:     pid,
-		keys:    keys,
-		created: time.Now(),
+		pid:        pid,
+		keys:       keys,
+		created:    time.Now(),
+		candidates: candidates,
 	}
-	// Store pre-built keys in the pending set (via closure in HandleUDPPacket).
-	_ = clientKeys
-	_ = serverKeys
-
 	p.pendingKeys = append(p.pendingKeys, pk)
+	log.Printf("[quic] registered keys: pid=%d candidates=%d hashType=%d pending=%d",
+		pid, len(candidates), keys.HashType, len(p.pendingKeys))
 
-	// Evict old pending keys.
-	if len(p.pendingKeys) > 32 {
-		p.pendingKeys = p.pendingKeys[len(p.pendingKeys)-16:]
+	// Time-based expiry only — no count-based eviction.
+	// The SSLKEYLOGFILE produces secrets for ALL TLS 1.3 connections (TCP + QUIC).
+	// With a large buffer we keep keys long enough for QUIC handshakes to complete.
+	if len(p.pendingKeys) > maxPendingKeys {
+		// Evict only expired entries.
+		n := 0
+		for _, k := range p.pendingKeys {
+			if !k.matched && time.Since(k.created) < pendingKeyTTL {
+				p.pendingKeys[n] = k
+				n++
+			}
+		}
+		p.pendingKeys = p.pendingKeys[:n]
 	}
-
-	log.Printf("[quic] registered keys for PID %d (suite=%d, pending=%d)",
-		pid, suite, len(p.pendingKeys))
 }
+
+const (
+	// maxPendingKeys is the hard cap on pending key entries. SSLKEYLOGFILE
+	// produces secrets for ALL TLS 1.3 connections — we need a large buffer
+	// to keep QUIC keys alive long enough for the handshake to complete.
+	maxPendingKeys = 8192
+	// pendingKeyTTL is how long pending keys are kept before expiry.
+	// 5 minutes is needed because:
+	// 1. SSLKEYLOGFILE bulk-loads keys from prior sessions at startup
+	// 2. QUIC connections may be established long before matching data packets arrive
+	// 3. Firefox reuses QUIC sessions across page navigations
+	pendingKeyTTL = 5 * time.Minute
+)
+
+// groThreshold is the size above which a short-header packet is likely
+// GRO-coalesced (multiple QUIC datagrams merged by the kernel's
+// generic-receive-offload). Standard QUIC datagrams are <= MTU (~1500 bytes).
+const groThreshold = 1500
 
 // HandleUDPPacket processes a UDP packet that may contain QUIC data.
 func (p *Processor) HandleUDPPacket(ev *types.RawPacketEvent) {
@@ -139,7 +195,7 @@ func (p *Processor) HandleUDPPacket(ev *types.RawPacketEvent) {
 	}
 	QUICPacketsReceived.Add(1)
 
-	// Split coalesced packets.
+	// Split coalesced packets (handles long header + trailing short header).
 	packets := splitCoalescedPackets(ev.Payload)
 
 	for _, pkt := range packets {
@@ -153,8 +209,153 @@ func (p *Processor) HandleUDPPacket(ev *types.RawPacketEvent) {
 			continue
 		}
 
-		p.processShortHeaderPacket(pkt, ev)
+		// If the packet is larger than a single QUIC datagram, it's likely a
+		// GRO-coalesced buffer (multiple datagrams merged by the kernel).
+		// Try splitting into individual QUIC datagrams.
+		if len(pkt) > groThreshold {
+			p.processGROPacket(pkt, ev)
+		} else {
+			p.processShortHeaderPacket(pkt, ev)
+		}
 	}
+}
+
+// processGROPacket handles a packet that hit the BPF capture limit (2047 bytes),
+// which is likely multiple GRO-coalesced QUIC datagrams. We try decrypting at
+// different split points to recover individual datagrams.
+func (p *Processor) processGROPacket(pkt []byte, ev *types.RawPacketEvent) {
+	// Try to find the connection first.
+	p.mu.Lock()
+	var conn *connState
+	var dcidLen int
+	for _, dl := range commonDCIDLengths {
+		if 1+dl > len(pkt) {
+			continue
+		}
+		dcidHex := hex.EncodeToString(pkt[1 : 1+dl])
+		if c, ok := p.connections[dcidHex]; ok {
+			conn = c
+			dcidLen = dl
+			break
+		}
+	}
+	p.mu.Unlock()
+
+	if conn == nil {
+		// No connection found — process normally (will try pending keys etc.)
+		p.processShortHeaderPacket(pkt, ev)
+		return
+	}
+
+	// Try to split by decrypting at decreasing datagram sizes.
+	// Standard QUIC datagrams are typically 1200-1452 bytes.
+	// We try from large to small to maximize data recovered.
+	splitSizes := []int{1452, 1400, 1350, 1300, 1252, 1200, 1100, 1000}
+
+	isServer := isQUICServerPort(ev.SrcPort)
+	keys := conn.server
+	largestPN := conn.largestServerPN
+	if !isServer {
+		keys = conn.client
+		largestPN = conn.largestClientPN
+	}
+	if keys == nil {
+		p.processShortHeaderPacket(pkt, ev)
+		return
+	}
+
+	off := 0
+	decrypted := 0
+	for off < len(pkt) {
+		remaining := pkt[off:]
+		if len(remaining) < 20 { // minimum QUIC packet size
+			break
+		}
+
+		// If this isn't a short header, stop.
+		if !isShortHeader(remaining[0]) {
+			break
+		}
+
+		// Try full remaining first (in case it's the last datagram).
+		pt, pn, err := decryptShortHeaderPacket(remaining, dcidLen, keys, conn.suite, largestPN)
+		if err == nil {
+			p.deliverDecryptedPacket(conn, pt, pn, isServer, ev)
+			decrypted++
+			break // remaining was a single complete datagram
+		}
+
+		// Try different split sizes.
+		found := false
+		for _, size := range splitSizes {
+			if size > len(remaining) || size < 20 {
+				continue
+			}
+			pt, pn, err := decryptShortHeaderPacket(remaining[:size], dcidLen, keys, conn.suite, largestPN)
+			if err == nil {
+				p.deliverDecryptedPacket(conn, pt, pn, isServer, ev)
+				decrypted++
+				if pn > largestPN {
+					largestPN = pn
+				}
+				off += size
+				found = true
+				break
+			}
+		}
+		if !found {
+			break // couldn't find a valid split point
+		}
+	}
+
+	if decrypted == 0 {
+		// GRO splitting didn't work — fall back to normal processing
+		// which will try alt direction, key update, etc.
+		p.processShortHeaderPacket(pkt, ev)
+	} else {
+		QUICGROSplits.Add(int64(decrypted))
+	}
+}
+
+// deliverDecryptedPacket processes a successfully decrypted QUIC packet.
+func (p *Processor) deliverDecryptedPacket(conn *connState, plaintext []byte, pn int64, isServer bool, ev *types.RawPacketEvent) {
+	QUICPacketsDecrypted.Add(1)
+
+	// Update the largest PN for this direction.
+	if isServer {
+		if pn > conn.largestServerPN {
+			conn.largestServerPN = pn
+		}
+	} else {
+		if pn > conn.largestClientPN {
+			conn.largestClientPN = pn
+		}
+	}
+
+	// Parse QUIC frames.
+	frames, newCIDs, err := parseFrames(plaintext)
+	if err != nil {
+		return
+	}
+
+	// Register any NEW_CONNECTION_ID frames.
+	if len(newCIDs) > 0 {
+		p.mu.Lock()
+		for _, cid := range newCIDs {
+			cidHex := hex.EncodeToString(cid)
+			if _, exists := p.connections[cidHex]; !exists {
+				p.connections[cidHex] = conn
+			}
+		}
+		p.mu.Unlock()
+	}
+
+	// Process STREAM frames.
+	conn.mu.Lock()
+	for _, sf := range frames {
+		conn.streams.addFrame(sf, isServer)
+	}
+	conn.mu.Unlock()
 }
 
 func (p *Processor) processShortHeaderPacket(pkt []byte, ev *types.RawPacketEvent) {
@@ -214,26 +415,52 @@ func (p *Processor) processShortHeaderPacket(pkt []byte, ev *types.RawPacketEven
 	conn.updated = time.Now()
 	p.mu.Unlock()
 
-	// Determine direction: if the server port is the src, we're reading server→client.
-	isServer := isQUICServerPort(ev.SrcPort)
-
-	var keys *directionKeys
-	if isServer {
-		keys = conn.server
-	} else {
-		keys = conn.client
+	// Attempt decryption, with fallback for DCID length collisions.
+	plaintext, pn, isServer := p.tryDecrypt(conn, pkt, dcidLen, ev)
+	if plaintext == nil {
+		// DCID length collision: the DCID lookup found a match at a short length
+		// (e.g., 3 bytes) but the actual DCID might be longer (e.g., 8 bytes for
+		// a different connection). Fall back to try-decrypt against all connections.
+		p.mu.Lock()
+		if matched, matchedLen := p.tryMatchExistingConnection(pkt, ev); matched != nil && matched != conn {
+			dcidHex := hex.EncodeToString(pkt[1 : 1+matchedLen])
+			p.connections[dcidHex] = matched
+			p.mu.Unlock()
+			matched.updated = time.Now()
+			plaintext, pn, isServer = p.tryDecrypt(matched, pkt, matchedLen, ev)
+			if plaintext != nil {
+				conn = matched
+				dcidLen = matchedLen
+			}
+		} else {
+			p.mu.Unlock()
+		}
 	}
-	if keys == nil {
-		QUICDecryptFailures.Add(1)
-		return
-	}
 
-	plaintext, _, err := decryptShortHeaderPacket(pkt, dcidLen, keys, conn.suite)
-	if err != nil {
+	if plaintext == nil {
 		QUICDecryptFailures.Add(1)
+		if QUICDecryptFailures.Load()%10 == 1 {
+			dcidHex := hex.EncodeToString(pkt[1 : 1+dcidLen])
+			log.Printf("[quic] decrypt fail: dcid=%s dcidLen=%d pid=%d gen=%d suite=%d pktLen=%d pkt0=%02x largestPN_c=%d largestPN_s=%d conn=%s:%d→%s:%d pkt_src=%s:%d→%s:%d",
+				dcidHex, dcidLen, conn.pid, conn.keyGeneration, conn.suite,
+				len(pkt), pkt[0], conn.largestClientPN, conn.largestServerPN,
+				conn.clientIP, conn.clientPort, conn.serverIP, conn.serverPort,
+				ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+		}
 		return
 	}
 	QUICPacketsDecrypted.Add(1)
+
+	// Update the largest PN for this direction.
+	if isServer {
+		if pn > conn.largestServerPN {
+			conn.largestServerPN = pn
+		}
+	} else {
+		if pn > conn.largestClientPN {
+			conn.largestClientPN = pn
+		}
+	}
 
 	// Parse QUIC frames.
 	frames, newCIDs, err := parseFrames(plaintext)
@@ -261,6 +488,62 @@ func (p *Processor) processShortHeaderPacket(pkt []byte, ev *types.RawPacketEven
 	conn.mu.Unlock()
 }
 
+// tryDecrypt attempts to decrypt a packet on a known connection.
+// Tries: primary direction → alternate direction → key update (up to 8 gens).
+// Returns (plaintext, pn, isServer) or (nil, 0, false) on failure.
+func (p *Processor) tryDecrypt(conn *connState, pkt []byte, dcidLen int, ev *types.RawPacketEvent) ([]byte, int64, bool) {
+	isServer := isQUICServerPort(ev.SrcPort)
+
+	var keys *directionKeys
+	if isServer {
+		keys = conn.server
+	} else {
+		keys = conn.client
+	}
+	if keys == nil {
+		return nil, 0, false
+	}
+
+	// Get the largest PN for this direction (for PN reconstruction).
+	largestPN := conn.largestClientPN
+	if isServer {
+		largestPN = conn.largestServerPN
+	}
+
+	plaintext, pn, err := decryptShortHeaderPacket(pkt, dcidLen, keys, conn.suite, largestPN)
+	if err != nil {
+		// Try the other direction's keys (port heuristic may be wrong).
+		var altKeys *directionKeys
+		altLargest := conn.largestServerPN
+		if isServer {
+			altKeys = conn.client
+			altLargest = conn.largestClientPN
+		} else {
+			altKeys = conn.server
+		}
+		if altKeys != nil {
+			if pt, p2, e := decryptShortHeaderPacket(pkt, dcidLen, altKeys, conn.suite, altLargest); e == nil {
+				plaintext = pt
+				pn = p2
+				isServer = !isServer
+				err = nil
+			}
+		}
+	}
+	if err != nil {
+		// Try QUIC Key Update (RFC 9001 §6): derive next-generation keys.
+		if pt, p2 := p.tryKeyUpdate(conn, pkt, dcidLen, isServer); pt != nil {
+			return pt, p2, isServer
+		}
+		// Log the first error for diagnostics.
+		if QUICDecryptFailures.Load()%10 == 0 {
+			log.Printf("[quic] tryDecrypt failed: %v (pktLen=%d dcidLen=%d)", err, len(pkt), dcidLen)
+		}
+		return nil, 0, false
+	}
+	return plaintext, pn, isServer
+}
+
 // tryMatchExistingConnection tries to decrypt a packet with each existing
 // connection's keys. This handles reverse-direction DCIDs — in QUIC, client
 // and server use different DCIDs, so the first direction to be matched
@@ -285,7 +568,7 @@ func (p *Processor) tryMatchExistingConnection(pkt []byte, ev *types.RawPacketEv
 				if 1+dcidLen+4+16 > len(pkt) {
 					continue
 				}
-				_, _, err := decryptShortHeaderPacket(pkt, dcidLen, keys, conn.suite)
+				_, _, err := decryptShortHeaderPacket(pkt, dcidLen, keys, conn.suite, -1)
 				if err == nil {
 					return conn, dcidLen
 				}
@@ -304,119 +587,168 @@ func (p *Processor) tryMatchPendingKeys(pkt []byte, ev *types.RawPacketEvent) *c
 		if pk.matched {
 			continue
 		}
-		// Expired.
-		if time.Since(pk.created) > 30*time.Second {
+		if time.Since(pk.created) > pendingKeyTTL {
 			continue
 		}
 
-		suite := cipherSuiteFromHashType(pk.keys.HashType)
-
-		// Try common DCID lengths.
-		for _, dcidLen := range commonDCIDLengths {
-			if 1+dcidLen+4+16 > len(pkt) {
-				continue
-			}
-
-			// Try BOTH directions' keys — the isQUICServerPort heuristic
-			// may be wrong, and we want to match whichever direction arrives first.
-			type dirAttempt struct {
-				key, iv, hp []byte
-				isServerDir bool
-			}
-			attempts := []dirAttempt{
-				{pk.keys.ClientKey, pk.keys.ClientIV, pk.keys.ClientHP, false},
-				{pk.keys.ServerKey, pk.keys.ServerIV, pk.keys.ServerHP, true},
-			}
-			// Try the expected direction first.
-			if isServer {
-				attempts[0], attempts[1] = attempts[1], attempts[0]
-			}
-
-			for _, att := range attempts {
-				keys, err := buildDirectionKeys(att.key, att.iv, att.hp, suite)
-				if err != nil {
+		// Try each cipher suite candidate and DCID length.
+		for _, cand := range pk.candidates {
+			for _, dcidLen := range commonDCIDLengths {
+				if 1+dcidLen+4+16 > len(pkt) {
 					continue
 				}
 
-				_, _, err = decryptShortHeaderPacket(pkt, dcidLen, keys, suite)
-				if err != nil {
-					continue
+				// Try both directions — the port heuristic may be wrong.
+				type dirAttempt struct {
+					keys        *directionKeys
+					isServerDir bool
+				}
+				attempts := []dirAttempt{
+					{cand.clientKeys, false},
+					{cand.serverKeys, true},
+				}
+				if isServer {
+					attempts[0], attempts[1] = attempts[1], attempts[0]
 				}
 
-				// Success! Create connection state.
-				pk.matched = true
-
-				clientKeys, _ := buildDirectionKeys(pk.keys.ClientKey, pk.keys.ClientIV, pk.keys.ClientHP, suite)
-				serverKeys, _ := buildDirectionKeys(pk.keys.ServerKey, pk.keys.ServerIV, pk.keys.ServerHP, suite)
-
-				pid := pk.pid
-
-				// Determine canonical client/server endpoints using the actual
-				// decryption result, not just the port heuristic.
-				var clientIP, serverIP string
-				var clientPort, serverPort uint16
-				if att.isServerDir {
-					// Matched with server keys → packet is server→client.
-					clientIP = ev.DstIP.String()
-					serverIP = ev.SrcIP.String()
-					clientPort = ev.DstPort
-					serverPort = ev.SrcPort
-				} else {
-					// Matched with client keys → packet is client→server.
-					clientIP = ev.SrcIP.String()
-					serverIP = ev.DstIP.String()
-					clientPort = ev.SrcPort
-					serverPort = ev.DstPort
-				}
-
-				conn := &connState{
-					client:     clientKeys,
-					server:     serverKeys,
-					suite:      suite,
-					dcidLen:    dcidLen,
-					pid:        pid,
-					clientIP:   clientIP,
-					serverIP:   serverIP,
-					clientPort: clientPort,
-					serverPort: serverPort,
-					updated:    time.Now(),
-				}
-				conn.streams = newStreamAssembler(func(streamID uint64, isServerDir bool, data []byte, fin bool) {
-					if p.h3Sink != nil {
-						QUICH3EventsEmitted.Add(1)
-						// Always pass canonical (client→server) direction;
-						// H3 parser uses isServer to separate per-direction buffers.
-						p.h3Sink(pid, "", streamID, isServerDir, data, fin, clientIP, serverIP, clientPort, serverPort)
+				for _, att := range attempts {
+					_, _, err := decryptShortHeaderPacket(pkt, dcidLen, att.keys, cand.suite, -1)
+					if err != nil {
+						continue
 					}
-				})
 
-				dcidHex := hex.EncodeToString(pkt[1 : 1+dcidLen])
-				p.connections[dcidHex] = conn
-				QUICConnectionsTracked.Add(1)
+					// Success! Create connection state.
+					pk.matched = true
+					pid := pk.pid
 
-				log.Printf("[quic] matched keys to DCID %s (pid=%d, dcidLen=%d, suite=%d, dir=%v)",
-					dcidHex, pid, dcidLen, suite, att.isServerDir)
-				return conn
+					var clientIP, serverIP string
+					var clientPort, serverPort uint16
+					if att.isServerDir {
+						clientIP = ev.DstIP.String()
+						serverIP = ev.SrcIP.String()
+						clientPort = ev.DstPort
+						serverPort = ev.SrcPort
+					} else {
+						clientIP = ev.SrcIP.String()
+						serverIP = ev.DstIP.String()
+						clientPort = ev.SrcPort
+						serverPort = ev.DstPort
+					}
+
+					conn := &connState{
+						client:          cand.clientKeys,
+						server:          cand.serverKeys,
+						suite:           cand.suite,
+						dcidLen:         dcidLen,
+						pid:             pid,
+						clientIP:        clientIP,
+						serverIP:        serverIP,
+						clientPort:      clientPort,
+						serverPort:      serverPort,
+						updated:         time.Now(),
+						largestClientPN: -1,
+						largestServerPN: -1,
+						clientSecret:    pk.keys.ClientSecret,
+						serverSecret:    pk.keys.ServerSecret,
+						hashType:        pk.keys.HashType,
+					}
+					conn.streams = newStreamAssembler(func(streamID uint64, isServerDir bool, data []byte, fin bool) {
+						if p.h3Sink != nil {
+							QUICH3EventsEmitted.Add(1)
+							p.h3Sink(pid, "", streamID, isServerDir, data, fin, clientIP, serverIP, clientPort, serverPort)
+						}
+					})
+
+					dcidHex := hex.EncodeToString(pkt[1 : 1+dcidLen])
+					p.connections[dcidHex] = conn
+					QUICConnectionsTracked.Add(1)
+
+					log.Printf("[quic] matched keys to DCID %s (pid=%d, dcidLen=%d, suite=%d, dir=%v)",
+						dcidHex, pid, dcidLen, cand.suite, att.isServerDir)
+					return conn
+				}
 			}
 		}
 	}
 	return nil
 }
 
-func buildDirectionKeys(key, iv, hp []byte, suite cipherSuite) (*directionKeys, error) {
-	if len(key) == 0 || len(iv) == 0 || len(hp) == 0 {
-		return nil, fmt.Errorf("incomplete keys")
+// maxKeyUpdateGens is the maximum number of key update generations to try.
+// QUIC endpoints can rotate keys multiple times; if we miss the transition
+// packets we need to fast-forward through several generations.
+const maxKeyUpdateGens = 8
+
+// tryKeyUpdate attempts QUIC Key Update (RFC 9001 §6) when normal decryption
+// fails on a matched connection. Derives up to maxKeyUpdateGens generations
+// of keys (advancing both directions together per RFC 9001 §6) and retries
+// decryption at each generation. On success, updates the connection state
+// with the new keys. Returns (plaintext, pn) or (nil, 0) on failure.
+func (p *Processor) tryKeyUpdate(conn *connState, pkt []byte, dcidLen int, isServer bool) ([]byte, int64) {
+	QUICKeyUpdateAttempts.Add(1)
+	if conn.clientSecret == nil || conn.serverSecret == nil {
+		QUICKeyUpdateNoSecret.Add(1)
+		return nil, 0
 	}
-	aead, err := newAEAD(suite, key)
-	if err != nil {
-		return nil, err
+
+	// Advance both directions together through generations.
+	// RFC 9001 §6: both endpoints update read and write keys together.
+	clientSecret := conn.clientSecret
+	serverSecret := conn.serverSecret
+
+	for gen := 1; gen <= maxKeyUpdateGens; gen++ {
+		// Derive next generation for both directions.
+		newClientSecret, newClientKeys, err := deriveKeyUpdate(clientSecret, conn.hashType, conn.suite)
+		if err != nil {
+			break
+		}
+		// HP keys are NOT updated during key update (RFC 9001 §6.3) — reuse originals.
+		newClientKeys.hp = conn.client.hp
+
+		newServerSecret, newServerKeys, err := deriveKeyUpdate(serverSecret, conn.hashType, conn.suite)
+		if err != nil {
+			break
+		}
+		newServerKeys.hp = conn.server.hp
+
+		// Try decryption with both directions at this generation.
+		// Prefer the direction matching the port heuristic, then try the other.
+		type dirAttempt struct {
+			keys      *directionKeys
+			largestPN int64
+			serverDir bool
+		}
+		attempts := []dirAttempt{
+			{newServerKeys, conn.largestServerPN, true},
+			{newClientKeys, conn.largestClientPN, false},
+		}
+		if !isServer {
+			attempts[0], attempts[1] = attempts[1], attempts[0]
+		}
+
+		for _, att := range attempts {
+			plaintext, pn, err := decryptShortHeaderPacket(pkt, dcidLen, att.keys, conn.suite, att.largestPN)
+			if err != nil {
+				continue
+			}
+
+			// Success — update both directions to this generation.
+			conn.keyGeneration += gen
+			conn.client = newClientKeys
+			conn.clientSecret = newClientSecret
+			conn.server = newServerKeys
+			conn.serverSecret = newServerSecret
+			QUICKeyUpdates.Add(1)
+			log.Printf("[quic] key update success: gen=%d direction=%v advanced=%d dcidLen=%d pid=%d",
+				conn.keyGeneration, att.serverDir, gen, dcidLen, conn.pid)
+			return plaintext, pn
+		}
+
+		// Chain to next generation.
+		clientSecret = newClientSecret
+		serverSecret = newServerSecret
 	}
-	return &directionKeys{
-		key:  key,
-		iv:   iv,
-		hp:   hp,
-		aead: aead,
-	}, nil
+
+	return nil, 0
 }
 
 // FlushExpired removes connections idle longer than maxAge.
@@ -438,7 +770,7 @@ func (p *Processor) FlushExpired(maxAge time.Duration) {
 	// Evict expired pending keys.
 	n := 0
 	for _, pk := range p.pendingKeys {
-		if time.Since(pk.created) < 30*time.Second && !pk.matched {
+		if time.Since(pk.created) < pendingKeyTTL && !pk.matched {
 			p.pendingKeys[n] = pk
 			n++
 		}
@@ -520,24 +852,41 @@ func (p *Processor) replayBuffered() {
 		if keys == nil {
 			continue
 		}
-		plaintext, _, err := decryptShortHeaderPacket(bp.pkt, dcidLen, keys, conn.suite)
+		largestPN := conn.largestClientPN
+		if isServer {
+			largestPN = conn.largestServerPN
+		}
+		plaintext, pn, err := decryptShortHeaderPacket(bp.pkt, dcidLen, keys, conn.suite, largestPN)
 		if err != nil {
 			// Try the other direction.
 			if isServer {
 				keys = conn.client
+				largestPN = conn.largestClientPN
 			} else {
 				keys = conn.server
+				largestPN = conn.largestServerPN
 			}
 			if keys == nil {
 				continue
 			}
-			plaintext, _, err = decryptShortHeaderPacket(bp.pkt, dcidLen, keys, conn.suite)
+			plaintext, pn, err = decryptShortHeaderPacket(bp.pkt, dcidLen, keys, conn.suite, largestPN)
 			if err != nil {
 				continue
 			}
 			isServer = !isServer
 		}
 		QUICPacketsDecrypted.Add(1)
+
+		// Update largest PN for this direction.
+		if isServer {
+			if pn > conn.largestServerPN {
+				conn.largestServerPN = pn
+			}
+		} else {
+			if pn > conn.largestClientPN {
+				conn.largestClientPN = pn
+			}
+		}
 
 		frames, newCIDs, _ := parseFrames(plaintext)
 		for _, cid := range newCIDs {

@@ -39,8 +39,18 @@ var (
 	sslEventsH2Routed  atomic.Int64
 	sslEventsH1Path    atomic.Int64
 	sslEventsSkipped   atomic.Int64
-
+	sslBodyHits        atomic.Int64 // SSL events with notable HTTP content
 )
+
+// sslContentPatterns are substrings scanned in raw SSL event data for diagnostics.
+// When any pattern is found, a one-time log is emitted to confirm the SSL uprobe
+// is capturing relevant data.
+var sslContentPatterns = []string{
+	"capital", "france", "paris",
+	"/api/", "completion", "chat_conversation",
+	"text/event-stream", "claude", "anthropic",
+	"\"messages\"", "\"content\"", "\"role\"",
+}
 
 const maxFlowBufSize = 256 * 1024 // 256 KB max accumulated per flow
 
@@ -149,6 +159,16 @@ func SSLEventStats() (received, h2preface, h2routed, h1path, skipped int64) {
 		sslEventsH2Routed.Load(), sslEventsH1Path.Load(), sslEventsSkipped.Load()
 }
 
+// SSLBodyHits returns the number of SSL events that contained notable HTTP content.
+func SSLBodyHits() int64 { return sslBodyHits.Load() }
+
+// H2ConnCount returns the number of tracked H2 connections.
+func (p *Parser) H2ConnCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.h2Conns)
+}
+
 // HandleSSLEvent appends ev.Data to the per-SSL-stream buffer and attempts to
 // parse a complete HTTP/1.1 or HTTP/2 message from the accumulated plaintext.
 func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
@@ -156,6 +176,31 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		return
 	}
 	sslEventsReceived.Add(1)
+
+	// Diagnostic: scan raw SSL data for notable HTTP content patterns.
+	// This confirms the SSL uprobe is capturing relevant data even when
+	// the H2 parser fails to produce events.
+	if len(ev.Data) > 10 {
+		dataStr := string(ev.Data)
+		for _, pat := range sslContentPatterns {
+			if strings.Contains(strings.ToLower(dataStr), pat) {
+				count := sslBodyHits.Add(1)
+				if count <= 20 || count%50 == 0 {
+					dir := "write"
+					if ev.IsRead {
+						dir = "read"
+					}
+					preview := dataStr
+					if len(preview) > 200 {
+						preview = preview[:200]
+					}
+					log.Printf("[ssl-content] HIT pat=%q %s pid=%d conn=0x%x len=%d preview=%.200s",
+						pat, dir, ev.PID, ev.ConnID, len(ev.Data), preview)
+				}
+				break // only log once per event
+			}
+		}
+	}
 
 	h2Key := h2ConnKey{PID: ev.PID, ConnID: ev.ConnID}
 
@@ -236,7 +281,12 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	if fb == nil {
 		// New flow — only start accumulating if the data looks like HTTP.
 		if !looksLikeHTTPStart(ev.Data, ev.IsRead) {
-			sslEventsSkipped.Add(1)
+			n := sslEventsSkipped.Add(1)
+			// Log first few skipped events for diagnostics.
+			if n <= 5 && len(ev.Data) > 20 {
+				log.Printf("[ssl-skip] pid=%d conn=0x%x isRead=%v len=%d first8=%x",
+					ev.PID, ev.ConnID, ev.IsRead, len(ev.Data), ev.Data[:min(8, len(ev.Data))])
+			}
 			return
 		}
 		p.mu.Lock()

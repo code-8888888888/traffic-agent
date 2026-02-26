@@ -29,6 +29,9 @@ type ConnectionKeys struct {
 	ServerKey []byte
 	ServerIV  []byte
 	ServerHP  []byte
+	// Raw traffic secrets — needed for QUIC Key Update (RFC 9001 §6).
+	ClientSecret []byte
+	ServerSecret []byte
 	// CipherSuite indicator derived from HashType.
 	// sha256(4) → AES-128-GCM or ChaCha20; sha384(5) → AES-256-GCM.
 	HashType uint32

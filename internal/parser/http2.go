@@ -22,6 +22,7 @@ package parser
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -201,7 +202,8 @@ func looksLikeH2MidConnection(data []byte) bool {
 		return streamID > 0 && frameLen >= 2
 	case h2FrameSettings: // 0x04
 		// SETTINGS: stream ID must be 0, length divisible by 6 (each setting is 6 bytes).
-		return streamID == 0 && frameLen%6 == 0
+		// Also accept ACK (length 0, flag 0x01).
+		return streamID == 0 && (frameLen%6 == 0 || frameLen == 0)
 	case h2FrameData: // 0x00
 		// DATA: stream ID must be > 0, and length >= 1.
 		return streamID > 0 && frameLen >= 1
@@ -211,6 +213,18 @@ func looksLikeH2MidConnection(data []byte) bool {
 	case h2FrameWindowUpdate: // 0x08
 		// WINDOW_UPDATE: fixed 4-byte payload.
 		return frameLen == 4
+	case h2FrameGoaway: // 0x07
+		// GOAWAY: at least 8 bytes (last stream ID + error code), stream ID 0.
+		return streamID == 0 && frameLen >= 8
+	case h2FrameRSTStream: // 0x03
+		// RST_STREAM: fixed 4-byte payload, non-zero stream ID.
+		return streamID > 0 && frameLen == 4
+	case h2FrameContinuation: // 0x09
+		// CONTINUATION: non-zero stream ID, non-empty payload.
+		return streamID > 0 && frameLen >= 1
+	case h2FramePriority: // 0x02
+		// PRIORITY: fixed 5-byte payload, non-zero stream ID.
+		return streamID > 0 && frameLen == 5
 	}
 	return false
 }
@@ -226,6 +240,13 @@ var (
 	h2cFramesParsed        atomic.Int64
 )
 
+// TLS H2 diagnostic counters.
+var (
+	h2TLSDataFrames   atomic.Int64
+	h2TLSHPACKErrors  atomic.Int64
+	h2TLSEventsEmitted atomic.Int64
+)
+
 // debugH2 enables verbose H2 frame-level logging.
 var debugH2 atomic.Bool
 
@@ -235,6 +256,11 @@ func SetH2Debug(on bool) { debugH2.Store(on) }
 // H2CStats returns snapshot counters for h2c connections and frames.
 func H2CStats() (connections, frames int64) {
 	return h2cConnectionsDetected.Load(), h2cFramesParsed.Load()
+}
+
+// H2TLSStats returns diagnostic counters for TLS H2 processing.
+func H2TLSStats() (dataFrames, hpackErrors, eventsEmitted int64) {
+	return h2TLSDataFrames.Load(), h2TLSHPACKErrors.Load(), h2TLSEventsEmitted.Load()
 }
 
 // handleH2Event appends data to the connection's direction buffer and
@@ -319,6 +345,8 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 	// If too many consecutive errors, the state is corrupt.
 	// Delete it so a fresh preface can re-create a clean state.
 	if state.consecutiveErrors >= maxH2ConsecutiveErrors {
+		log.Printf("[h2] deleting corrupt connection state pid=%d conn=0x%x (consecutive_errors=%d)",
+			connKey.PID, connKey.ConnID, state.consecutiveErrors)
 		delete(p.h2Conns, connKey)
 	}
 
@@ -502,7 +530,12 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 	dec.SetEmitEnabled(false)
 
 	if err != nil {
-		log.Printf("[h2] HPACK decode error (isRead=%v stream=%d): %v", isRead, streamID, err)
+		h2TLSHPACKErrors.Add(1)
+		if h2TLSHPACKErrors.Load()%20 == 1 || debugH2.Load() {
+			hexSnippet := fmt.Sprintf("%x", block[:min(32, len(block))])
+			log.Printf("[h2] HPACK decode error (isRead=%v stream=%d blockLen=%d partial_fields=%d): %v  block[:32]=%s",
+				isRead, streamID, len(block), len(fields), err, hexSnippet)
+		}
 
 		// Dynamic table out of sync (agent missed earlier frames or
 		// garbage data leaked in).  Replace the stored decoder with a
@@ -656,6 +689,10 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		return
 	}
 
+	if meta.Protocol == "TLS" {
+		h2TLSDataFrames.Add(1)
+	}
+
 	body := payload
 	// Strip padding if PADDED flag (0x08) is set.
 	if flags&h2FlagPadded != 0 {
@@ -671,6 +708,24 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 	}
 	if len(body) == 0 {
 		return
+	}
+
+	// Log substantial DATA frame content for diagnostics.
+	if meta.Protocol == "TLS" && len(body) > 20 {
+		h2TLSEventsEmitted.Add(1)
+		if h2TLSEventsEmitted.Load()%100 == 1 || debugH2.Load() {
+			preview := string(body[:min(120, len(body))])
+			dir := "write"
+			if isRead {
+				dir = "read"
+			}
+			hasInfo := "no-headers"
+			if s.activeStreams[streamID] != nil {
+				hasInfo = fmt.Sprintf("method=%s url=%s", s.activeStreams[streamID].method, s.activeStreams[streamID].path)
+			}
+			log.Printf("[h2-data] %s stream=%d len=%d info=%s pid=%d preview=%.120s",
+				dir, streamID, len(body), hasInfo, meta.PID, preview)
+		}
 	}
 
 	// Truncate to snippet limit.

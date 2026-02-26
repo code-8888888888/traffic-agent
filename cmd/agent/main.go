@@ -181,12 +181,17 @@ func main() {
 				rx, h2p, h2r, h1, skip := parser.SSLEventStats()
 				sslDrops := tls.SSLDropCountReset()
 				if rx > 0 || sslDrops > 0 {
-					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d chan_len=%d",
-						rx, h2p, h2r, h1, skip, sslDrops, len(sslEventCh))
+					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d chan_len=%d body_hits=%d h2conns=%d",
+						rx, h2p, h2r, h1, skip, sslDrops, len(sslEventCh), parser.SSLBodyHits(), p.H2ConnCount())
 				}
 				h2cConns, h2cFrames := parser.H2CStats()
 				if h2cConns > 0 || h2cFrames > 0 {
 					log.Printf("[stats] h2c: connections=%d frames=%d", h2cConns, h2cFrames)
+				}
+				h2df, h2he, h2ee := parser.H2TLSStats()
+				if h2df > 0 || h2he > 0 {
+					log.Printf("[stats] H2/TLS: data_frames=%d hpack_errors=%d events_emitted=%d",
+						h2df, h2he, h2ee)
 				}
 			}
 		}()
@@ -215,9 +220,10 @@ func main() {
 			}
 			qConns, qRecv, qDecrypt, qFail, qH3 := quic.QUICStats()
 			if qRecv > 0 || qConns > 0 {
-				log.Printf("[stats] QUIC: connections=%d received=%d decrypted=%d failures=%d h3_events=%d long_hdr=%d rev_miss=%d",
+				log.Printf("[stats] QUIC: connections=%d received=%d decrypted=%d failures=%d h3_events=%d long_hdr=%d rev_miss=%d gro=%d ku=%d",
 					qConns, qRecv, qDecrypt, qFail, qH3,
-					quic.QUICLongHeaderSkipped.Load(), quic.QUICReverseMisses.Load())
+					quic.QUICLongHeaderSkipped.Load(), quic.QUICReverseMisses.Load(),
+					quic.QUICGROSplits.Load(), quic.QUICKeyUpdates.Load())
 			}
 		}
 	}()

@@ -245,13 +245,15 @@ func (w *KeylogWatcher) deriveAndDeliver(sp *secretPair) {
 	}
 
 	keys := &ConnectionKeys{
-		ClientKey: clientKey,
-		ClientIV:  clientIV,
-		ClientHP:  clientHP,
-		ServerKey: serverKey,
-		ServerIV:  serverIV,
-		ServerHP:  serverHP,
-		HashType:  hashType,
+		ClientKey:    clientKey,
+		ClientIV:     clientIV,
+		ClientHP:     clientHP,
+		ServerKey:    serverKey,
+		ServerIV:     serverIV,
+		ServerHP:     serverHP,
+		ClientSecret: sp.clientSecret,
+		ServerSecret: sp.serverSecret,
+		HashType:     hashType,
 	}
 
 	log.Printf("[keylog] derived QUIC keys: key=%d/%d iv=%d/%d hp=%d/%d hash=%d",

@@ -15,11 +15,16 @@ package quic
 import (
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
+	"hash"
+	"io"
 
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/hkdf"
 )
 
 // cipherSuite identifies a QUIC cipher suite.
@@ -41,6 +46,18 @@ func cipherSuiteFromHashType(hashType uint32) cipherSuite {
 		return cipherAES256GCM
 	default: // sha256 (4) or unknown
 		return cipherAES128GCM
+	}
+}
+
+// cipherSuiteCandidates returns all cipher suites to try for a given hash type.
+// SHA-256 secrets could be either AES-128-GCM or ChaCha20-Poly1305, so we
+// try both. SHA-384 is always AES-256-GCM.
+func cipherSuiteCandidates(hashType uint32) []cipherSuite {
+	switch hashType {
+	case 5: // sha384
+		return []cipherSuite{cipherAES256GCM}
+	default: // sha256 (4)
+		return []cipherSuite{cipherAES128GCM, cipherChaCha20Poly1305}
 	}
 }
 
@@ -132,13 +149,37 @@ func removeHeaderProtection(packet []byte, headerLen int, hpKey []byte, suite ci
 		packet[headerLen+i] ^= mask[1+i]
 	}
 
-	// Decode packet number.
+	// Decode truncated packet number.
 	pn = 0
 	for i := 0; i < pnLen; i++ {
 		pn = (pn << 8) | int64(packet[headerLen+i])
 	}
 
 	return pn, pnLen, nil
+}
+
+// reconstructPN reconstructs the full packet number from a truncated value
+// using the largest successfully processed PN as context. Implements
+// RFC 9000 Appendix A (DecodePacketNumber).
+//
+// The sender encodes only the least significant bits of the PN. The receiver
+// reconstructs the full value using the highest PN it has seen so far.
+func reconstructPN(truncatedPN int64, pnLen int, largestPN int64) int64 {
+	pnNbits := uint(pnLen) * 8
+	pnWin := int64(1) << pnNbits
+	pnHwin := pnWin / 2
+	pnMask := pnWin - 1
+
+	expectedPN := largestPN + 1
+	candidatePN := (expectedPN & ^pnMask) | truncatedPN
+
+	if candidatePN <= expectedPN-pnHwin && candidatePN < (1<<62)-pnWin {
+		return candidatePN + pnWin
+	}
+	if candidatePN > expectedPN+pnHwin && candidatePN >= pnWin {
+		return candidatePN - pnWin
+	}
+	return candidatePN
 }
 
 // constructNonce builds the AEAD nonce from the IV and packet number (RFC 9001 §5.3).
@@ -168,8 +209,10 @@ func decryptPayload(aead cipher.AEAD, nonce, header, ciphertext []byte) ([]byte,
 }
 
 // decryptShortHeaderPacket performs full decryption of a QUIC short header packet:
-// header protection removal → PN decode → AEAD decrypt.
-func decryptShortHeaderPacket(packet []byte, dcidLen int, keys *directionKeys, suite cipherSuite) ([]byte, int64, error) {
+// header protection removal → PN decode → PN reconstruct → AEAD decrypt.
+// largestPN is the highest successfully processed PN for this direction
+// (used for PN reconstruction per RFC 9000 §A). Pass -1 if unknown.
+func decryptShortHeaderPacket(packet []byte, dcidLen int, keys *directionKeys, suite cipherSuite, largestPN int64) ([]byte, int64, error) {
 	headerLen := 1 + dcidLen // minimum header before PN
 
 	// Make a working copy since header protection removal modifies in place.
@@ -177,9 +220,17 @@ func decryptShortHeaderPacket(packet []byte, dcidLen int, keys *directionKeys, s
 	copy(pkt, packet)
 
 	// Remove header protection.
-	pn, pnLen, err := removeHeaderProtection(pkt, headerLen, keys.hp, suite)
+	truncatedPN, pnLen, err := removeHeaderProtection(pkt, headerLen, keys.hp, suite)
 	if err != nil {
 		return nil, 0, err
+	}
+
+	// Reconstruct full packet number (RFC 9000 Appendix A).
+	var pn int64
+	if largestPN >= 0 {
+		pn = reconstructPN(truncatedPN, pnLen, largestPN)
+	} else {
+		pn = truncatedPN
 	}
 
 	// Full header length includes the packet number.
@@ -205,4 +256,127 @@ type directionKeys struct {
 	iv   []byte
 	hp   []byte
 	aead cipher.AEAD
+}
+
+// deriveKeyUpdate derives the next generation of QUIC keys from the current
+// traffic secret, per RFC 9001 §6:
+//
+//	updated_secret = HKDF-Expand-Label(current_secret, "quic ku", "", secret_len)
+//	updated_key    = HKDF-Expand-Label(updated_secret, "quic key", "", key_len)
+//	updated_iv     = HKDF-Expand-Label(updated_secret, "quic iv",  "", 12)
+//
+// Header protection keys are NOT updated during key update.
+func deriveKeyUpdate(currentSecret []byte, hashType uint32, suite cipherSuite) (newSecret []byte, newKeys *directionKeys, err error) {
+	hashFunc := hashFuncForType(hashType)
+	secretLen := len(currentSecret)
+
+	// Derive the new secret.
+	newSecret, err = hkdfExpandLabelQuic(hashFunc, currentSecret, "quic ku", secretLen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive ku secret: %w", err)
+	}
+
+	keyLen := keyLenForSuite(suite)
+	newKey, err := hkdfExpandLabelQuic(hashFunc, newSecret, "quic key", keyLen)
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive ku key: %w", err)
+	}
+	newIV, err := hkdfExpandLabelQuic(hashFunc, newSecret, "quic iv", 12)
+	if err != nil {
+		return nil, nil, fmt.Errorf("derive ku iv: %w", err)
+	}
+
+	aead, err := newAEAD(suite, newKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return newSecret, &directionKeys{
+		key:  newKey,
+		iv:   newIV,
+		hp:   nil, // HP key is NOT updated
+		aead: aead,
+	}, nil
+}
+
+// deriveDirectionKeysFromSecrets derives complete direction keys (key, iv, hp)
+// for both client and server from raw traffic secrets for a specific cipher suite.
+// This is needed because different cipher suites require different key lengths
+// (AES-128-GCM uses 16-byte keys, ChaCha20-Poly1305 uses 32-byte keys).
+func deriveDirectionKeysFromSecrets(clientSecret, serverSecret []byte, hashFunc func() hash.Hash, keyLen int, suite cipherSuite) (*directionKeys, *directionKeys, error) {
+	// Derive client keys.
+	ck, err := deriveOneDirection(clientSecret, hashFunc, keyLen, suite)
+	if err != nil {
+		return nil, nil, fmt.Errorf("client keys: %w", err)
+	}
+	// Derive server keys.
+	sk, err := deriveOneDirection(serverSecret, hashFunc, keyLen, suite)
+	if err != nil {
+		return nil, nil, fmt.Errorf("server keys: %w", err)
+	}
+	return ck, sk, nil
+}
+
+// deriveOneDirection derives key, iv, and hp from a single traffic secret.
+func deriveOneDirection(secret []byte, hashFunc func() hash.Hash, keyLen int, suite cipherSuite) (*directionKeys, error) {
+	key, err := hkdfExpandLabelQuic(hashFunc, secret, "quic key", keyLen)
+	if err != nil {
+		return nil, err
+	}
+	iv, err := hkdfExpandLabelQuic(hashFunc, secret, "quic iv", 12)
+	if err != nil {
+		return nil, err
+	}
+	hp, err := hkdfExpandLabelQuic(hashFunc, secret, "quic hp", keyLen)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := newAEAD(suite, key)
+	if err != nil {
+		return nil, err
+	}
+	return &directionKeys{
+		key:  key,
+		iv:   iv,
+		hp:   hp,
+		aead: aead,
+	}, nil
+}
+
+func keyLenForSuite(suite cipherSuite) int {
+	switch suite {
+	case cipherAES256GCM:
+		return 32
+	case cipherChaCha20Poly1305:
+		return 32
+	default:
+		return 16
+	}
+}
+
+func hashFuncForType(hashType uint32) func() hash.Hash {
+	switch hashType {
+	case 5: // sha384
+		return sha512.New384
+	default: // sha256
+		return sha256.New
+	}
+}
+
+// hkdfExpandLabelQuic implements TLS 1.3 HKDF-Expand-Label for QUIC.
+func hkdfExpandLabelQuic(hashFunc func() hash.Hash, secret []byte, label string, length int) ([]byte, error) {
+	fullLabel := "tls13 " + label
+	info := make([]byte, 2+1+len(fullLabel)+1)
+	info[0] = byte(length >> 8)
+	info[1] = byte(length)
+	info[2] = byte(len(fullLabel))
+	copy(info[3:], fullLabel)
+	info[3+len(fullLabel)] = 0 // empty context
+
+	out := make([]byte, length)
+	r := hkdf.Expand(hashFunc, secret, info)
+	if _, err := io.ReadFull(r, out); err != nil {
+		return nil, fmt.Errorf("HKDF-Expand-Label(%s): %w", label, err)
+	}
+	return out, nil
 }

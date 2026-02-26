@@ -27,8 +27,13 @@
 #define TC_ACT_SHOT 2
 
 /* Max sizes — must be a power of 2 to enable the verifier-required mask trick
- * (copy_len &= MAX_PAYLOAD_SIZE - 1). Actual max captured payload is 2047 bytes. */
-#define MAX_PAYLOAD_SIZE 2048
+ * (copy_len &= MAX_PAYLOAD_SIZE - 1).
+ *
+ * 16384 is large enough to handle GRO-coalesced UDP datagrams (the kernel's
+ * generic-receive-offload merges multiple QUIC datagrams into one large skb
+ * before the TC ingress hook). Typical GRO batches are 3-8 datagrams at
+ * ~1400 bytes each = ~4200-11200 bytes. */
+#define MAX_PAYLOAD_SIZE 16384
 /* MAX_SSL_DATA_SIZE: bytes copied per SSL_write/SSL_read uretprobe call.
  * Must be large enough to capture a complete HTTP/1.1 request header block
  * plus POST body in a single SSL_write.  16 KiB matches the default HTTP/2
