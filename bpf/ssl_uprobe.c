@@ -560,22 +560,28 @@ int uprobe_quic_hkdf_expand_entry(struct pt_regs *ctx)
     struct quic_hkdf_args args = {};
 
 #if defined(__TARGET_ARCH_arm64)
-    /* ARM64: x4=label, w5=labelLen, w6=variant, x7=output, [sp+0]=outputLen */
-    args.label_ptr  = PT_REGS_PARM5(ctx);    /* x4 */
-    args.label_len  = (__u32)PT_REGS_PARM6(ctx);  /* w5 */
-    args.variant    = (__u32)ctx->regs[6];         /* w6 — no PT_REGS_PARM7 */
-    args.output_ptr = ctx->regs[7];                /* x7 */
-    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);   /* w1 */
-    /* 9th arg is on stack */
+    /* ARM64 calling convention: x0-x7 hold first 8 args, 9th on stack.
+     * tls13_HkdfExpandLabelRaw(prk, baseHash, hsHash, hsHashLen, label,
+     *                          labelLen, variant, output, outputLen)
+     * PT_REGS_PARM macros only go up to PARM5 (x4). Access x5-x7 via regs[]. */
+    #define PT_REGS_ARM64_REG(x, n) (((const volatile struct user_pt_regs *)(x))->regs[n])
+    args.label_ptr  = PT_REGS_PARM5(ctx);                  /* x4 = label */
+    args.label_len  = (__u32)PT_REGS_ARM64_REG(ctx, 5);    /* x5 = labelLen */
+    args.variant    = (__u32)PT_REGS_ARM64_REG(ctx, 6);    /* x6 = variant */
+    args.output_ptr = PT_REGS_ARM64_REG(ctx, 7);           /* x7 = output */
+    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);           /* x1 = baseHash */
+    /* 9th arg (outputLen) is on stack */
     __u32 output_len = 0;
     bpf_probe_read_user(&output_len, sizeof(output_len), (void *)(PT_REGS_SP(ctx)));
     args.output_len = output_len;
+    #undef PT_REGS_ARM64_REG
 #else
     /* x86_64: rdi=prk, rsi=baseHash, rdx=hsHash, rcx=hsHashLen, r8=label, r9=labelLen
-     * stack: [rsp+8]=variant, [rsp+16]=output, [rsp+24]=outputLen */
-    args.label_ptr  = PT_REGS_PARM5(ctx);    /* r8 */
-    args.label_len  = (__u32)PT_REGS_PARM6(ctx);  /* r9 */
-    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);   /* rsi */
+     * stack: [rsp+8]=variant, [rsp+16]=output, [rsp+24]=outputLen
+     * PT_REGS_PARM5 = r8. r9 (6th reg param) has no macro — read from ctx->r9. */
+    args.label_ptr  = PT_REGS_PARM5(ctx);           /* r8 = label */
+    args.label_len  = (__u32)ctx->r9;                /* r9 = labelLen */
+    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);    /* rsi = baseHash */
     __u32 variant = 0;
     bpf_probe_read_user(&variant, sizeof(variant), (void *)(PT_REGS_SP(ctx) + 8));
     args.variant = variant;

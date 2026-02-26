@@ -12,13 +12,6 @@ import (
 	"github.com/cilium/ebpf"
 )
 
-type SSLUprobeSslArgs struct {
-	Buf    uint64
-	ConnId uint64
-	Num    uint32
-	Pad    uint32
-}
-
 type SSLUprobeQuicHkdfArgs struct {
 	LabelPtr  uint64
 	OutputPtr uint64
@@ -26,6 +19,13 @@ type SSLUprobeQuicHkdfArgs struct {
 	OutputLen uint32
 	HashType  uint32
 	Variant   uint32
+}
+
+type SSLUprobeSslArgs struct {
+	Buf    uint64
+	ConnId uint64
+	Num    uint32
+	Pad    uint32
 }
 
 // LoadSSLUprobe returns the embedded CollectionSpec for SSLUprobe.
@@ -69,26 +69,26 @@ type SSLUprobeSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type SSLUprobeProgramSpecs struct {
-	UprobeSslReadEntry          *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
-	UprobeSslReadEntryNspr      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry_nspr"`
-	UprobeSslWriteEntry         *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry"`
-	UprobeSslWriteEntryCap      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry_cap"`
-	UprobeSslWritevEntryCap     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_writev_entry_cap"`
-	UretprobeSslReadRet         *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ret"`
-	UretprobeSslWriteRet        *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ret"`
-	UprobeQuicHkdfExpandEntry   *ebpf.ProgramSpec `ebpf:"uprobe_quic_hkdf_expand_entry"`
-	UretprobeQuicHkdfExpandRet  *ebpf.ProgramSpec `ebpf:"uretprobe_quic_hkdf_expand_ret"`
+	UprobeQuicHkdfExpandEntry  *ebpf.ProgramSpec `ebpf:"uprobe_quic_hkdf_expand_entry"`
+	UprobeSslReadEntry         *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslReadEntryNspr     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_entry_nspr"`
+	UprobeSslWriteEntry        *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry"`
+	UprobeSslWriteEntryCap     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_entry_cap"`
+	UprobeSslWritevEntryCap    *ebpf.ProgramSpec `ebpf:"uprobe_ssl_writev_entry_cap"`
+	UretprobeQuicHkdfExpandRet *ebpf.ProgramSpec `ebpf:"uretprobe_quic_hkdf_expand_ret"`
+	UretprobeSslReadRet        *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ret"`
+	UretprobeSslWriteRet       *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ret"`
 }
 
 // SSLUprobeMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type SSLUprobeMapSpecs struct {
-	ActiveSslReadArgs    *ebpf.MapSpec `ebpf:"active_ssl_read_args"`
-	ActiveSslWriteArgs   *ebpf.MapSpec `ebpf:"active_ssl_write_args"`
-	ActiveQuicHkdfArgs   *ebpf.MapSpec `ebpf:"active_quic_hkdf_args"`
-	SslEvents            *ebpf.MapSpec `ebpf:"ssl_events"`
-	QuicKeyEvents        *ebpf.MapSpec `ebpf:"quic_key_events"`
+	ActiveQuicHkdfArgs *ebpf.MapSpec `ebpf:"active_quic_hkdf_args"`
+	ActiveSslReadArgs  *ebpf.MapSpec `ebpf:"active_ssl_read_args"`
+	ActiveSslWriteArgs *ebpf.MapSpec `ebpf:"active_ssl_write_args"`
+	QuicKeyEvents      *ebpf.MapSpec `ebpf:"quic_key_events"`
+	SslEvents          *ebpf.MapSpec `ebpf:"ssl_events"`
 }
 
 // SSLUprobeObjects contains all objects after they have been loaded into the kernel.
@@ -110,20 +110,20 @@ func (o *SSLUprobeObjects) Close() error {
 //
 // It can be passed to LoadSSLUprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SSLUprobeMaps struct {
-	ActiveSslReadArgs    *ebpf.Map `ebpf:"active_ssl_read_args"`
-	ActiveSslWriteArgs   *ebpf.Map `ebpf:"active_ssl_write_args"`
-	ActiveQuicHkdfArgs   *ebpf.Map `ebpf:"active_quic_hkdf_args"`
-	SslEvents            *ebpf.Map `ebpf:"ssl_events"`
-	QuicKeyEvents        *ebpf.Map `ebpf:"quic_key_events"`
+	ActiveQuicHkdfArgs *ebpf.Map `ebpf:"active_quic_hkdf_args"`
+	ActiveSslReadArgs  *ebpf.Map `ebpf:"active_ssl_read_args"`
+	ActiveSslWriteArgs *ebpf.Map `ebpf:"active_ssl_write_args"`
+	QuicKeyEvents      *ebpf.Map `ebpf:"quic_key_events"`
+	SslEvents          *ebpf.Map `ebpf:"ssl_events"`
 }
 
 func (m *SSLUprobeMaps) Close() error {
 	return _SSLUprobeClose(
+		m.ActiveQuicHkdfArgs,
 		m.ActiveSslReadArgs,
 		m.ActiveSslWriteArgs,
-		m.ActiveQuicHkdfArgs,
-		m.SslEvents,
 		m.QuicKeyEvents,
+		m.SslEvents,
 	)
 }
 
@@ -131,36 +131,33 @@ func (m *SSLUprobeMaps) Close() error {
 //
 // It can be passed to LoadSSLUprobeObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SSLUprobePrograms struct {
-	UprobeSslReadEntry          *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
-	UprobeSslReadEntryNspr      *ebpf.Program `ebpf:"uprobe_ssl_read_entry_nspr"`
-	UprobeSslWriteEntry         *ebpf.Program `ebpf:"uprobe_ssl_write_entry"`
-	UprobeSslWriteEntryCap      *ebpf.Program `ebpf:"uprobe_ssl_write_entry_cap"`
-	UprobeSslWritevEntryCap     *ebpf.Program `ebpf:"uprobe_ssl_writev_entry_cap"`
-	UretprobeSslReadRet         *ebpf.Program `ebpf:"uretprobe_ssl_read_ret"`
-	UretprobeSslWriteRet        *ebpf.Program `ebpf:"uretprobe_ssl_write_ret"`
-	UprobeQuicHkdfExpandEntry   *ebpf.Program `ebpf:"uprobe_quic_hkdf_expand_entry"`
-	UretprobeQuicHkdfExpandRet  *ebpf.Program `ebpf:"uretprobe_quic_hkdf_expand_ret"`
+	UprobeQuicHkdfExpandEntry  *ebpf.Program `ebpf:"uprobe_quic_hkdf_expand_entry"`
+	UprobeSslReadEntry         *ebpf.Program `ebpf:"uprobe_ssl_read_entry"`
+	UprobeSslReadEntryNspr     *ebpf.Program `ebpf:"uprobe_ssl_read_entry_nspr"`
+	UprobeSslWriteEntry        *ebpf.Program `ebpf:"uprobe_ssl_write_entry"`
+	UprobeSslWriteEntryCap     *ebpf.Program `ebpf:"uprobe_ssl_write_entry_cap"`
+	UprobeSslWritevEntryCap    *ebpf.Program `ebpf:"uprobe_ssl_writev_entry_cap"`
+	UretprobeQuicHkdfExpandRet *ebpf.Program `ebpf:"uretprobe_quic_hkdf_expand_ret"`
+	UretprobeSslReadRet        *ebpf.Program `ebpf:"uretprobe_ssl_read_ret"`
+	UretprobeSslWriteRet       *ebpf.Program `ebpf:"uretprobe_ssl_write_ret"`
 }
 
 func (p *SSLUprobePrograms) Close() error {
 	return _SSLUprobeClose(
+		p.UprobeQuicHkdfExpandEntry,
 		p.UprobeSslReadEntry,
 		p.UprobeSslReadEntryNspr,
 		p.UprobeSslWriteEntry,
 		p.UprobeSslWriteEntryCap,
 		p.UprobeSslWritevEntryCap,
+		p.UretprobeQuicHkdfExpandRet,
 		p.UretprobeSslReadRet,
 		p.UretprobeSslWriteRet,
-		p.UprobeQuicHkdfExpandEntry,
-		p.UretprobeQuicHkdfExpandRet,
 	)
 }
 
 func _SSLUprobeClose(closers ...io.Closer) error {
 	for _, closer := range closers {
-		if closer == nil {
-			continue
-		}
 		if err := closer.Close(); err != nil {
 			return err
 		}

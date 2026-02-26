@@ -192,6 +192,17 @@ func main() {
 		}()
 	}
 
+	// ---- SSLKEYLOGFILE-based QUIC key extraction (optional) ----
+	if cfg.TLS.SSLKeyLogFile != "" {
+		keylogWatcher := tls.NewKeylogWatcher(cfg.TLS.SSLKeyLogFile)
+		keylogWatcher.RegisterKeyCallback(func(pid uint32, keys *tls.ConnectionKeys) {
+			quicProc.RegisterKeys(pid, keys)
+		})
+		keylogWatcher.Start()
+		defer keylogWatcher.Stop()
+		log.Printf("[main] SSLKEYLOGFILE watcher active: %s", cfg.TLS.SSLKeyLogFile)
+	}
+
 	// Periodic TC capture stats (drop counter) + QUIC stats.
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)

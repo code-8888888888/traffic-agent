@@ -102,6 +102,11 @@ type TLSConfig struct {
 	// or dynamically loaded BoringSSL (e.g. Chromium, Electron, some Node.js builds).
 	// These are handled independently of the system libssl.so uprobe path.
 	BoringSSlExecutables []BoringSSlExecutable `yaml:"boringssl_executables"`
+	// SSLKeyLogFile is the path to an SSLKEYLOGFILE (NSS/OpenSSL key log).
+	// When set, the agent reads TLS traffic secrets from this file and derives
+	// QUIC encryption keys for HTTP/3 decryption.
+	// Set SSLKEYLOGFILE=<path> when starting Firefox to populate this file.
+	SSLKeyLogFile string `yaml:"ssl_keylog_file"`
 }
 
 // StreamConfig configures the HTTP event streaming endpoint.
