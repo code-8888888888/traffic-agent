@@ -12,6 +12,8 @@ package quic
 //
 // Limitation: only in-order reassembly is supported (same as existing TC capture).
 
+import "log"
+
 // streamBuf holds accumulated data for one QUIC stream direction.
 type streamBuf struct {
 	data       []byte
@@ -66,6 +68,8 @@ func (sa *streamAssembler) addFrame(sf streamFrame, isServer bool) {
 			return
 		}
 		// Gap — deliver what we have and reset.
+		log.Printf("[stream-gap] stream=%d isServer=%v expected=%d got=%d gap=%d dataLen=%d fin=%v",
+			sf.StreamID, isServer, buf.nextOffset, sf.Offset, sf.Offset-buf.nextOffset, len(sf.Data), sf.Fin)
 		if len(buf.data) > 0 && sa.callback != nil {
 			sa.callback(sf.StreamID, isServer, buf.data, false)
 			buf.data = nil

@@ -163,6 +163,11 @@ func (p *H3Parser) HandleStreamData(pid uint32, processName string, streamID uin
 		state.streamBufs[bufKey] = buf[consumed:]
 	}
 	if fin {
+		remaining := state.streamBufs[bufKey]
+		if len(remaining) > 0 && isH3BidiRequestStream(streamID) {
+			log.Printf("[h3-WARN] stream=%d/%s FIN with %d unconsumed bytes (incomplete H3 frame) first_bytes=%x srcPort=%d",
+				streamID, map[bool]string{true: "S", false: "C"}[isServer], len(remaining), firstN(remaining, 32), srcPort)
+		}
 		delete(state.streamBufs, bufKey)
 	}
 
@@ -233,7 +238,17 @@ func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, isServe
 	emit func(*types.TrafficEvent)) {
 
 	fields := qpackDecode(payload)
+	if h3Debug {
+		log.Printf("[h3-debug] HEADERS stream=%d isServer=%v payloadLen=%d decodedFields=%d payload[:32]=%x",
+			streamID, isServer, len(payload), len(fields), firstN(payload, 32))
+		for i, f := range fields {
+			log.Printf("[h3-debug]   field[%d] name=%q value=%.80q", i, f.Name, f.Value)
+		}
+	}
 	if len(fields) == 0 {
+		if len(payload) > 0 {
+			log.Printf("[h3-debug] QPACK decode returned 0 fields for %d bytes: %x", len(payload), firstN(payload, 48))
+		}
 		return
 	}
 

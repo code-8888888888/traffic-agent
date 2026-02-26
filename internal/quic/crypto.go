@@ -225,6 +225,11 @@ func decryptShortHeaderPacket(packet []byte, dcidLen int, keys *directionKeys, s
 		return nil, 0, err
 	}
 
+	// Full header length includes the packet number.
+	fullHeaderLen := headerLen + pnLen
+	header := pkt[:fullHeaderLen]
+	ciphertext := pkt[fullHeaderLen:]
+
 	// Reconstruct full packet number (RFC 9000 Appendix A).
 	var pn int64
 	if largestPN >= 0 {
@@ -233,21 +238,31 @@ func decryptShortHeaderPacket(packet []byte, dcidLen int, keys *directionKeys, s
 		pn = truncatedPN
 	}
 
-	// Full header length includes the packet number.
-	fullHeaderLen := headerLen + pnLen
-
-	// Construct nonce.
+	// Construct nonce and try decryption.
 	nonce := constructNonce(keys.iv, pn)
-
-	// Decrypt.
-	header := pkt[:fullHeaderLen]
-	ciphertext := pkt[fullHeaderLen:]
 	plaintext, err := decryptPayload(keys.aead, nonce, header, ciphertext)
-	if err != nil {
-		return nil, 0, err
+	if err == nil {
+		return plaintext, pn, nil
 	}
 
-	return plaintext, pn, nil
+	// If largestPN is -1 (unknown), the truncated PN may be wrong for connections
+	// where the PN space has advanced past 2^pnBits. Try candidate PNs by stepping
+	// through multiples of the PN window (256 for 1-byte, 65536 for 2-byte, etc.).
+	// This handles pre-existing QUIC connections where we missed early packets.
+	if largestPN < 0 {
+		pnWin := int64(1) << (uint(pnLen) * 8)
+		// Try up to 16 PN windows (covers PN up to ~4096 for 1-byte truncation).
+		for step := int64(1); step <= 16; step++ {
+			candidatePN := truncatedPN + step*pnWin
+			nonce = constructNonce(keys.iv, candidatePN)
+			plaintext, err = decryptPayload(keys.aead, nonce, header, ciphertext)
+			if err == nil {
+				return plaintext, candidatePN, nil
+			}
+		}
+	}
+
+	return nil, 0, err
 }
 
 // directionKeys holds keys for one direction (client→server or server→client).

@@ -22,6 +22,7 @@ package parser
 
 import (
 	"io"
+	"log"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -145,7 +146,7 @@ func qpackDecode(data []byte) []qpackHeaderField {
 	}
 
 	// Read Required Insert Count (8-bit prefix integer) — accept any value.
-	_, rest, err := qpackReadVarInt(8, data)
+	ric, rest, err := qpackReadVarInt(8, data)
 	if err != nil {
 		return nil
 	}
@@ -157,6 +158,7 @@ func qpackDecode(data []byte) []qpackHeaderField {
 	}
 
 	var fields []qpackHeaderField
+	dynSkips := 0
 
 	for len(rest) > 0 {
 		b := rest[0]
@@ -176,11 +178,13 @@ func qpackDecode(data []byte) []qpackHeaderField {
 				}
 			} else {
 				// Dynamic table reference — skip.
-				_, r, err := qpackReadVarInt(6, rest)
+				idx, r, err := qpackReadVarInt(6, rest)
 				if err != nil {
 					return fields
 				}
 				rest = r
+				dynSkips++
+				_ = idx
 			}
 
 		case b&0xC0 == 0x40:
@@ -211,11 +215,13 @@ func qpackDecode(data []byte) []qpackHeaderField {
 					return fields
 				}
 				rest = r
-				_, r, err = qpackReadString(rest, 7)
+				val, r, err := qpackReadString(rest, 7)
 				if err != nil {
 					return fields
 				}
 				rest = r
+				dynSkips++
+				_ = val
 			}
 
 		case b&0xE0 == 0x20:
@@ -260,6 +266,9 @@ func qpackDecode(data []byte) []qpackHeaderField {
 		}
 	}
 
+	if dynSkips > 0 && ric > 0 {
+		log.Printf("[qpack] decoded %d fields, skipped %d dynamic refs (ric=%d, dataLen=%d)", len(fields), dynSkips, ric, len(data))
+	}
 	return fields
 }
 

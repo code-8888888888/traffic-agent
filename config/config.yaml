@@ -47,10 +47,10 @@ filter:
 # -----------------------------------------------------------------------
 output:
   # Write JSON events to stdout.
-  stdout: true
+  stdout: false
 
   # Write JSON events to a rotating log file.
-  # file: /var/log/traffic-agent/events.json
+  file: events.json
 
   # Maximum file size before rotation (megabytes).
   max_size_mb: 100
@@ -79,6 +79,10 @@ tls:
   # processes:
   #   - nginx
   #   - python3
+
+  # SSLKEYLOGFILE path for QUIC key extraction. Firefox must be started with
+  # SSLKEYLOGFILE=/path/to/keylog.txt to write TLS secrets to this file.
+  ssl_keylog_file: /home/ubuntu/quic-keylog.txt
 
   # Explicit path to libssl.so. Leave empty for auto-detection via
   # /proc/<pid>/maps (recommended).

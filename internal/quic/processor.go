@@ -388,12 +388,20 @@ func (p *Processor) processShortHeaderPacket(pkt []byte, ev *types.RawPacketEven
 			dcidLen = matchedLen
 			dcidHex := hex.EncodeToString(pkt[1 : 1+dcidLen])
 			p.connections[dcidHex] = conn
-			log.Printf("[quic] registered reverse DCID %s (pid=%d, isServer=%v)", dcidHex, conn.pid, isServer)
+			log.Printf("[quic] registered reverse DCID %s (pid=%d, isServer=%v, largestPN_c=%d largestPN_s=%d)",
+				dcidHex, conn.pid, isServer, conn.largestClientPN, conn.largestServerPN)
 		} else if nConns > 0 {
 			QUICReverseMisses.Add(1)
 			if QUICReverseMisses.Load()%50 == 1 {
-				log.Printf("[quic] reverse miss: src=%s:%d dst=%s:%d isServer=%v conns=%d pkt[0]=%02x len=%d",
-					ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort, isServer, nConns, pkt[0], len(pkt))
+				// Log DCID candidates for debugging.
+				var dcidSample string
+				if len(pkt) >= 9 {
+					dcidSample = hex.EncodeToString(pkt[1:9])
+				} else if len(pkt) > 1 {
+					dcidSample = hex.EncodeToString(pkt[1:])
+				}
+				log.Printf("[quic] reverse miss: src=%s:%d dst=%s:%d isServer=%v conns=%d pkt[0]=%02x len=%d dcid8=%s",
+					ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort, isServer, nConns, pkt[0], len(pkt), dcidSample)
 			}
 		}
 	}
@@ -560,17 +568,36 @@ func (p *Processor) tryMatchExistingConnection(pkt []byte, ev *types.RawPacketEv
 
 		// Try both directions — the isQUICServerPort heuristic may be
 		// wrong, and QUIC connections can use any port.
-		for _, keys := range []*directionKeys{conn.server, conn.client} {
-			if keys == nil {
+		// Use actual largestPN for PN reconstruction — critical for connections
+		// where PN has advanced past 255 (1-byte truncated PN won't reconstruct
+		// correctly with largestPN=-1).
+		type dirAttempt struct {
+			keys      *directionKeys
+			largestPN int64
+		}
+		attempts := []dirAttempt{
+			{conn.server, conn.largestServerPN},
+			{conn.client, conn.largestClientPN},
+		}
+		for _, att := range attempts {
+			if att.keys == nil {
 				continue
 			}
 			for _, dcidLen := range allDCIDLengths(conn.dcidLen) {
 				if 1+dcidLen+4+16 > len(pkt) {
 					continue
 				}
-				_, _, err := decryptShortHeaderPacket(pkt, dcidLen, keys, conn.suite, -1)
+				// Try with actual largestPN first (correct for advanced PN spaces).
+				_, _, err := decryptShortHeaderPacket(pkt, dcidLen, att.keys, conn.suite, att.largestPN)
 				if err == nil {
 					return conn, dcidLen
+				}
+				// Fallback: try with largestPN=-1 for early packets where PN < 256.
+				if att.largestPN > 0 {
+					_, _, err = decryptShortHeaderPacket(pkt, dcidLen, att.keys, conn.suite, -1)
+					if err == nil {
+						return conn, dcidLen
+					}
 				}
 			}
 		}
