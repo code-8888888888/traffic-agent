@@ -108,6 +108,39 @@ func PurgeProcCache() {
 	globalProcCache.mu.Unlock()
 }
 
+// LookupUDPProcessCached resolves PID/comm for a UDP packet, using a TTL cache
+// to avoid repeated /proc scans. Safe to call from multiple goroutines.
+func LookupUDPProcessCached(srcIP, dstIP net.IP, srcPort, dstPort uint16, direction uint8) (uint32, string) {
+	var localIP net.IP
+	var localPort uint16
+	if direction == 1 { // DIR_EGRESS
+		localIP, localPort = srcIP, srcPort
+	} else {
+		localIP, localPort = dstIP, dstPort
+	}
+
+	key := makeProcKey(srcIP, dstIP, srcPort, dstPort)
+
+	globalProcCache.mu.RLock()
+	if entry, ok := globalProcCache.entries[key]; ok && time.Since(entry.timestamp) < procCacheTTL {
+		globalProcCache.mu.RUnlock()
+		return entry.pid, entry.comm
+	}
+	globalProcCache.mu.RUnlock()
+
+	pid, comm := lookupUDPProcess(localIP, localPort)
+
+	globalProcCache.mu.Lock()
+	globalProcCache.entries[key] = procEntry{
+		pid:       pid,
+		comm:      comm,
+		timestamp: time.Now(),
+	}
+	globalProcCache.mu.Unlock()
+
+	return pid, comm
+}
+
 // ---- Raw /proc lookups (unchanged) ----
 
 // lookupTCPProcess finds the PID and comm for a TCP 4-tuple.
@@ -171,6 +204,52 @@ func ipv4ToHex(ip net.IP) string {
 	// which is the byte-swapped value.
 	val := binary.LittleEndian.Uint32(ip4)
 	return fmt.Sprintf("%08X", val)
+}
+
+// lookupUDPProcess finds the PID and comm for a UDP socket by local address.
+// UDP is connectionless, so we only match on local IP:port (no remote pair).
+// Returns (0, "") when no match is found.
+func lookupUDPProcess(localIP net.IP, localPort uint16) (uint32, string) {
+	inode := findUDPSocketInode(localIP, localPort)
+	if inode == 0 {
+		return 0, ""
+	}
+	return findPIDBySocketInode(inode)
+}
+
+// findUDPSocketInode returns the socket inode from /proc/net/udp for the
+// given local address. Returns 0 if not found.
+func findUDPSocketInode(localIP net.IP, localPort uint16) uint64 {
+	localHex := ipv4ToHex(localIP)
+	if localHex == "" {
+		return 0
+	}
+	want := fmt.Sprintf("%s:%04X", localHex, localPort)
+
+	f, err := os.Open("/proc/net/udp")
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Scan() // skip header line
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.Contains(line, localHex) {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		// fields[1] is local_address:port
+		if fields[1] == want {
+			inode, _ := strconv.ParseUint(fields[9], 10, 64)
+			return inode
+		}
+	}
+	return 0
 }
 
 // findPIDBySocketInode scans /proc/*/fd/ for a symlink pointing to

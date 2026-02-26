@@ -3,8 +3,8 @@
  * tc_capture.c - eBPF TC (Traffic Control) program for passive packet capture
  *
  * Attached to both ingress and egress hooks on a network interface via the
- * Linux TC subsystem. Extracts TCP packet metadata and payload for HTTP/HTTPS
- * traffic and forwards events to userspace via a BPF ring buffer.
+ * Linux TC subsystem. Extracts TCP and UDP packet metadata and payload for
+ * HTTP/HTTPS/QUIC traffic and forwards events to userspace via a BPF ring buffer.
  *
  * Compile via bpf2go (see internal/capture/gen.go):
  *   go generate ./internal/capture/
@@ -101,49 +101,69 @@ static __always_inline int process_packet(struct __sk_buff *skb, __u8 direction)
     if ((void *)(ip + 1) > data_end)
         return TC_ACT_OK;
 
-    if (ip->protocol != IPPROTO_TCP)
+    if (ip->protocol != IPPROTO_TCP && ip->protocol != IPPROTO_UDP)
         return TC_ACT_OK;
 
-    /* --- TCP --- */
-    /* Explicitly bound ihl and doff so the verifier can track payload_off range.
-     * RFC 791: IHL is 4 bits, valid range 5-15 (20-60 bytes).
-     * RFC 793: Data Offset is 4 bits, valid range 5-15 (20-60 bytes). */
     __u32 ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < 20 || ip_hdr_len > 60)
         return TC_ACT_OK;
 
-    struct tcphdr *tcp = (void *)ip + ip_hdr_len;
-    if ((void *)(tcp + 1) > data_end)
-        return TC_ACT_OK;
+    __u16 src_port, dst_port;
+    __u32 payload_off;
 
-    __u16 src_port = bpf_ntohs(tcp->source);
-    __u16 dst_port = bpf_ntohs(tcp->dest);
+    if (ip->protocol == IPPROTO_TCP) {
+        /* --- TCP --- */
+        /* Explicitly bound ihl and doff so the verifier can track payload_off range.
+         * RFC 791: IHL is 4 bits, valid range 5-15 (20-60 bytes).
+         * RFC 793: Data Offset is 4 bits, valid range 5-15 (20-60 bytes). */
+        struct tcphdr *tcp = (void *)ip + ip_hdr_len;
+        if ((void *)(tcp + 1) > data_end)
+            return TC_ACT_OK;
 
-    if (!should_capture(dst_port, src_port))
-        return TC_ACT_OK;
+        src_port = bpf_ntohs(tcp->source);
+        dst_port = bpf_ntohs(tcp->dest);
 
-    __u32 tcp_hdr_len = tcp->doff * 4;
-    if (tcp_hdr_len < 20 || tcp_hdr_len > 60)
-        return TC_ACT_OK;
+        if (!should_capture(dst_port, src_port))
+            return TC_ACT_OK;
 
-    /* Payload offset is bounded [54, 134] from the ihl/doff bounds above.
-     * NOTE: we intentionally do NOT check (payload_off >= skb->len) here.
-     * Doing so would cause the compiler to compute (skb->len - payload_off)
-     * at that early branch, spill it to the stack, and later reload the
-     * pre-mask value for bpf_skb_load_bytes — giving the verifier
-     * smin=-134 and triggering "R4 min value is negative".
-     * Instead we defer the check to right before bpf_skb_load_bytes. */
-    __u32 payload_off = ETH_HLEN + ip_hdr_len + tcp_hdr_len;
+        __u32 tcp_hdr_len = tcp->doff * 4;
+        if (tcp_hdr_len < 20 || tcp_hdr_len > 60)
+            return TC_ACT_OK;
+
+        /* Payload offset is bounded [54, 134] from the ihl/doff bounds above.
+         * NOTE: we intentionally do NOT check (payload_off >= skb->len) here.
+         * Doing so would cause the compiler to compute (skb->len - payload_off)
+         * at that early branch, spill it to the stack, and later reload the
+         * pre-mask value for bpf_skb_load_bytes — giving the verifier
+         * smin=-134 and triggering "R4 min value is negative".
+         * Instead we defer the check to right before bpf_skb_load_bytes. */
+        payload_off = ETH_HLEN + ip_hdr_len + tcp_hdr_len;
+    } else {
+        /* --- UDP --- */
+        /* UDP header is a fixed 8 bytes: src_port(2) + dst_port(2) + length(2) + checksum(2). */
+        struct udphdr *udp = (void *)ip + ip_hdr_len;
+        if ((void *)(udp + 1) > data_end)
+            return TC_ACT_OK;
+
+        src_port = bpf_ntohs(udp->source);
+        dst_port = bpf_ntohs(udp->dest);
+
+        if (!should_capture(dst_port, src_port))
+            return TC_ACT_OK;
+
+        payload_off = ETH_HLEN + ip_hdr_len + 8;
+    }
 
     /* --- Apply filter config --- */
     __u32 zero = 0;
     struct filter_config *cfg = bpf_map_lookup_elem(&filter_config_map, &zero);
     if (cfg) {
-        /* Bit 1 (0x2): skip TLS-encrypted ports.  When SSL uprobes are
-         * active, port 443/8443 payloads are ciphertext — useless for the
+        /* Bit 1 (0x2): skip TLS-encrypted TCP ports.  When SSL uprobes are
+         * active, TCP port 443/8443 payloads are ciphertext — useless for the
          * parser, and the plaintext is already captured by the SSL path.
-         * Skipping here avoids ring buffer and CPU waste. */
-        if ((cfg->flags & 0x2) &&
+         * UDP port 443 is NOT skipped — QUIC packets need TC capture for
+         * decryption in userspace using extracted QUIC keys. */
+        if ((cfg->flags & 0x2) && ip->protocol == IPPROTO_TCP &&
             (dst_port == 443 || src_port == 443 ||
              dst_port == 8443 || src_port == 8443))
             return TC_ACT_OK;

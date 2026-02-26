@@ -52,6 +52,20 @@ type SSLEvent struct {
 	Data        []byte
 }
 
+// QUICKeyEvent is emitted by the QUIC HKDF BPF probe when a QUIC key
+// derivation completes. Each event carries one key (key/iv/hp) for one
+// direction — a full connection requires 6 events (3 labels × 2 directions).
+type QUICKeyEvent struct {
+	TimestampNS uint64
+	PID         uint32
+	TID         uint32
+	ProcessName string
+	Label       string // "quic key", "quic iv", "quic hp"
+	KeyData     []byte
+	HashType    uint32 // SSLHashType (sha256=4, sha384=5)
+	Variant     uint32 // SSLProtocolVariant (1 = datagram/QUIC)
+}
+
 // TrafficEvent is the fully-parsed, enriched event that flows to the output
 // layer. Fields are populated progressively as the event moves through the
 // pipeline; unpopulated fields retain their zero values.

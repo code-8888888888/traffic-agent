@@ -488,8 +488,169 @@ int uprobe_ssl_read_entry_nspr(struct pt_regs *ctx)
     return 0;
 }
 
+/* -----------------------------------------------------------------------
+ * QUIC key extraction via tls13_HkdfExpandLabelRaw
+ *
+ * Firefox's neqo (Rust QUIC engine) derives QUIC encryption keys by calling
+ * SSL_HkdfExpandLabelWithMech → tls13_HkdfExpandLabelRaw in NSS's libssl3.so.
+ * This internal function writes raw key material into a caller-provided buffer.
+ *
+ * By hooking entry (to capture args) and return (to read the output buffer),
+ * we extract the plaintext QUIC keys (key/iv/hp) without any MITM.
+ *
+ * Signature (9 parameters):
+ *   SECStatus tls13_HkdfExpandLabelRaw(
+ *       PK11SymKey *prk,           // x0 (ignored)
+ *       SSLHashType baseHash,      // w1
+ *       const PRUint8 *hsHash,     // x2 (ignored, NULL for QUIC)
+ *       unsigned int hsHashLen,     // w3 (ignored)
+ *       const char *label,         // x4
+ *       unsigned int labelLen,      // w5
+ *       SSLProtocolVariant variant, // w6
+ *       unsigned char *output,      // x7
+ *       unsigned int outputLen      // [sp+0] (9th arg, on stack)
+ *   )
+ *
+ * ARM64: args 1-8 in x0-x7, arg 9 on stack at [sp+0].
+ * x86_64: args 1-6 in rdi/rsi/rdx/rcx/r8/r9, args 7-9 on stack.
+ * --------------------------------------------------------------------- */
+
+#define MAX_QUIC_KEY_SIZE 48
+#define MAX_QUIC_LABEL_LEN 16
+
+struct quic_key_event {
+    __u64 timestamp_ns;
+    __u32 pid;
+    __u32 tid;
+    __u8  comm[TASK_COMM_LEN];
+    __u8  label[MAX_QUIC_LABEL_LEN];
+    __u32 label_len;
+    __u32 key_len;
+    __u8  key_data[MAX_QUIC_KEY_SIZE];
+    __u32 hash_type;
+    __u32 variant;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 256 * 1024);  /* 256 KB — key events are rare (~6 per connection) */
+} quic_key_events SEC(".maps");
+
+struct quic_hkdf_args {
+    __u64 label_ptr;
+    __u64 output_ptr;
+    __u32 label_len;
+    __u32 output_len;
+    __u32 hash_type;
+    __u32 variant;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, struct quic_hkdf_args);
+} active_quic_hkdf_args SEC(".maps");
+
+SEC("uprobe/quic_hkdf_expand_entry")
+int uprobe_quic_hkdf_expand_entry(struct pt_regs *ctx)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+
+    struct quic_hkdf_args args = {};
+
+#if defined(__TARGET_ARCH_arm64)
+    /* ARM64: x4=label, w5=labelLen, w6=variant, x7=output, [sp+0]=outputLen */
+    args.label_ptr  = PT_REGS_PARM5(ctx);    /* x4 */
+    args.label_len  = (__u32)PT_REGS_PARM6(ctx);  /* w5 */
+    args.variant    = (__u32)ctx->regs[6];         /* w6 — no PT_REGS_PARM7 */
+    args.output_ptr = ctx->regs[7];                /* x7 */
+    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);   /* w1 */
+    /* 9th arg is on stack */
+    __u32 output_len = 0;
+    bpf_probe_read_user(&output_len, sizeof(output_len), (void *)(PT_REGS_SP(ctx)));
+    args.output_len = output_len;
+#else
+    /* x86_64: rdi=prk, rsi=baseHash, rdx=hsHash, rcx=hsHashLen, r8=label, r9=labelLen
+     * stack: [rsp+8]=variant, [rsp+16]=output, [rsp+24]=outputLen */
+    args.label_ptr  = PT_REGS_PARM5(ctx);    /* r8 */
+    args.label_len  = (__u32)PT_REGS_PARM6(ctx);  /* r9 */
+    args.hash_type  = (__u32)PT_REGS_PARM2(ctx);   /* rsi */
+    __u32 variant = 0;
+    bpf_probe_read_user(&variant, sizeof(variant), (void *)(PT_REGS_SP(ctx) + 8));
+    args.variant = variant;
+    __u64 output_ptr = 0;
+    bpf_probe_read_user(&output_ptr, sizeof(output_ptr), (void *)(PT_REGS_SP(ctx) + 16));
+    args.output_ptr = output_ptr;
+    __u32 output_len = 0;
+    bpf_probe_read_user(&output_len, sizeof(output_len), (void *)(PT_REGS_SP(ctx) + 24));
+    args.output_len = output_len;
+#endif
+
+    bpf_map_update_elem(&active_quic_hkdf_args, &tid, &args, BPF_ANY);
+    return 0;
+}
+
+SEC("uretprobe/quic_hkdf_expand_ret")
+int uretprobe_quic_hkdf_expand_ret(struct pt_regs *ctx)
+{
+    __u32 tid = (__u32)bpf_get_current_pid_tgid();
+
+    struct quic_hkdf_args *args = bpf_map_lookup_elem(&active_quic_hkdf_args, &tid);
+    if (!args)
+        return 0;
+
+    /* SECSuccess = 0 */
+    int ret = (int)PT_REGS_RC(ctx);
+    if (ret != 0)
+        goto cleanup;
+
+    __u32 key_len = args->output_len;
+    if (key_len == 0 || key_len > MAX_QUIC_KEY_SIZE)
+        goto cleanup;
+
+    struct quic_key_event *ev = bpf_ringbuf_reserve(&quic_key_events, sizeof(*ev), 0);
+    if (!ev)
+        goto cleanup;
+
+    ev->timestamp_ns = bpf_ktime_get_ns();
+    ev->pid          = ((__u64)bpf_get_current_pid_tgid()) >> 32;
+    ev->tid          = tid;
+    bpf_get_current_comm(ev->comm, sizeof(ev->comm));
+    ev->hash_type    = args->hash_type;
+    ev->variant      = args->variant;
+    ev->key_len      = key_len;
+
+    /* Read the label string. */
+    ev->label_len = args->label_len;
+    if (ev->label_len > MAX_QUIC_LABEL_LEN)
+        ev->label_len = MAX_QUIC_LABEL_LEN;
+    /* Ensure verifier sees a bounded read size. */
+    __u32 safe_label_len = ev->label_len & (MAX_QUIC_LABEL_LEN - 1);
+    if (safe_label_len > 0) {
+        if (bpf_probe_read_user(ev->label, safe_label_len, (void *)args->label_ptr) < 0) {
+            bpf_ringbuf_discard(ev, 0);
+            goto cleanup;
+        }
+    }
+
+    /* Read the output key data. */
+    __u32 safe_key_len = key_len & (MAX_QUIC_KEY_SIZE - 1);
+    if (safe_key_len == 0)
+        safe_key_len = key_len < MAX_QUIC_KEY_SIZE ? key_len : MAX_QUIC_KEY_SIZE;
+    if (bpf_probe_read_user(ev->key_data, safe_key_len, (void *)args->output_ptr) < 0) {
+        bpf_ringbuf_discard(ev, 0);
+        goto cleanup;
+    }
+
+    bpf_ringbuf_submit(ev, 0);
+
+cleanup:
+    bpf_map_delete_elem(&active_quic_hkdf_args, &tid);
+    return 0;
+}
+
 /*
- * TODO: Go crypto/tls interception
  *
  * Go's TLS stack does not link against libssl.so, so the SSL_read/write
  * uprobes above will not intercept Go HTTPS traffic.

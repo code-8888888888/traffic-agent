@@ -21,6 +21,7 @@ import (
 	"github.com/traffic-agent/traffic-agent/internal/filter"
 	"github.com/traffic-agent/traffic-agent/internal/output"
 	"github.com/traffic-agent/traffic-agent/internal/parser"
+	"github.com/traffic-agent/traffic-agent/internal/quic"
 	"github.com/traffic-agent/traffic-agent/internal/tls"
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
@@ -83,6 +84,11 @@ func main() {
 		parser.SetH2Debug(true)
 	}
 
+	// ---- Build QUIC / HTTP/3 pipeline ----
+	h3Parser := parser.NewH3Parser(sink)
+	quicProc := quic.NewProcessor(h3Parser.HandleStreamData)
+	defer quicProc.Stop()
+
 	// ---- Start TC packet capture ----
 	rawPacketCh := make(chan *types.RawPacketEvent, 4096)
 
@@ -96,9 +102,8 @@ func main() {
 	defer cap.Stop()
 
 	// Feed raw packets into the HTTP parser via 2 worker goroutines.
-	// Process lookup (LookupTCPProcessCached) runs here, off the ring buffer
-	// reader hot path, so a slow /proc scan on one worker doesn't block the
-	// other worker or the ring buffer reader.
+	// Process lookup runs here, off the ring buffer reader hot path, so a
+	// slow /proc scan on one worker doesn't block the other or the reader.
 	const tcWorkers = 2
 	for i := 0; i < tcWorkers; i++ {
 		go func() {
@@ -106,22 +111,33 @@ func main() {
 				if !f.AllowRaw(ev) {
 					continue
 				}
-				// Fill in PID/comm from cached /proc lookup.
-				pid, comm := capture.LookupTCPProcessCached(
-					ev.SrcIP, ev.DstIP, ev.SrcPort, ev.DstPort, uint8(ev.Direction))
-				ev.PID = pid
-				ev.ProcessName = comm
-				p.HandlePacket(ev)
+
+				if ev.Protocol == 17 { // UDP
+					// Fill in PID/comm for UDP.
+					pid, comm := capture.LookupUDPProcessCached(
+						ev.SrcIP, ev.DstIP, ev.SrcPort, ev.DstPort, uint8(ev.Direction))
+					ev.PID = pid
+					ev.ProcessName = comm
+					quicProc.HandleUDPPacket(ev)
+				} else { // TCP
+					pid, comm := capture.LookupTCPProcessCached(
+						ev.SrcIP, ev.DstIP, ev.SrcPort, ev.DstPort, uint8(ev.Direction))
+					ev.PID = pid
+					ev.ProcessName = comm
+					p.HandlePacket(ev)
+				}
 			}
 		}()
 	}
 
-	// Periodically flush stale TCP streams and purge proc cache.
+	// Periodically flush stale TCP/QUIC streams and purge proc cache.
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			p.FlushExpired(60 * time.Second)
+			h3Parser.FlushExpired(60 * time.Second)
+			quicProc.FlushExpired(60 * time.Second)
 			capture.PurgeProcCache()
 		}
 	}()
@@ -131,6 +147,12 @@ func main() {
 		sslEventCh := make(chan *types.SSLEvent, 4096)
 
 		interceptor := tls.New(cfg.TLS)
+
+		// Wire QUIC key delivery: TLS interceptor → QUICKeyStore → QUICProcessor.
+		interceptor.QUICKeyStore().RegisterKeyCallback(func(pid uint32, keys *tls.ConnectionKeys) {
+			quicProc.RegisterKeys(pid, keys)
+		})
+
 		if err := interceptor.Start(sslEventCh); err != nil {
 			log.Printf("[main] TLS interceptor start error: %v", err)
 		} else {
@@ -170,7 +192,7 @@ func main() {
 		}()
 	}
 
-	// Periodic TC capture stats (drop counter).
+	// Periodic TC capture stats (drop counter) + QUIC stats.
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -179,6 +201,11 @@ func main() {
 			if drops > 0 {
 				log.Printf("[stats] TC packet drops (channel full): %d in last 5s, chan_len=%d",
 					drops, len(rawPacketCh))
+			}
+			qConns, qRecv, qDecrypt, qFail, qH3 := quic.QUICStats()
+			if qRecv > 0 || qConns > 0 {
+				log.Printf("[stats] QUIC: connections=%d received=%d decrypted=%d failures=%d h3_events=%d",
+					qConns, qRecv, qDecrypt, qFail, qH3)
 			}
 		}
 	}()
