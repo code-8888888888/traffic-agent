@@ -9,7 +9,6 @@ require (
 )
 
 require (
-	github.com/quic-go/qpack v0.6.0
 	github.com/vishvananda/netlink v1.1.0
 	golang.org/x/crypto v0.48.0
 	golang.org/x/net v0.50.0

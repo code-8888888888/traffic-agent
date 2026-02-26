@@ -6,9 +6,13 @@ package quic
 // QUIC packets. This module accumulates data per stream ID and delivers
 // complete chunks to the HTTP/3 parser.
 //
+// Important: QUIC bidirectional streams have independent offset spaces per
+// direction. Client→server and server→client data on the same stream ID are
+// tracked separately using a (streamID, isServer) composite key.
+//
 // Limitation: only in-order reassembly is supported (same as existing TC capture).
 
-// streamBuf holds accumulated data for one QUIC stream.
+// streamBuf holds accumulated data for one QUIC stream direction.
 type streamBuf struct {
 	data       []byte
 	nextOffset uint64 // expected next byte offset for in-order delivery
@@ -17,31 +21,40 @@ type streamBuf struct {
 
 const maxStreamBufSize = 256 * 1024 // 256 KB
 
+// streamKey identifies a stream direction uniquely.
+type streamKey struct {
+	streamID uint64
+	isServer bool // true = server→client direction
+}
+
 // StreamDataCallback is called when stream data is available for processing.
 // streamID: the QUIC stream ID (0, 4, 8, ... for bidi client-initiated)
+// isServer: true if data was sent by the server
 // data: accumulated stream bytes
 // fin: true if this is the final data for the stream
-type StreamDataCallback func(streamID uint64, data []byte, fin bool)
+type StreamDataCallback func(streamID uint64, isServer bool, data []byte, fin bool)
 
 // streamAssembler manages per-stream buffers for a connection.
 type streamAssembler struct {
-	streams  map[uint64]*streamBuf
+	streams  map[streamKey]*streamBuf
 	callback StreamDataCallback
 }
 
 func newStreamAssembler(cb StreamDataCallback) *streamAssembler {
 	return &streamAssembler{
-		streams:  make(map[uint64]*streamBuf),
+		streams:  make(map[streamKey]*streamBuf),
 		callback: cb,
 	}
 }
 
 // addFrame processes a STREAM frame, accumulating data and delivering when ready.
-func (sa *streamAssembler) addFrame(sf streamFrame) {
-	buf, ok := sa.streams[sf.StreamID]
+// isServer indicates whether this frame came from the server direction.
+func (sa *streamAssembler) addFrame(sf streamFrame, isServer bool) {
+	key := streamKey{streamID: sf.StreamID, isServer: isServer}
+	buf, ok := sa.streams[key]
 	if !ok {
 		buf = &streamBuf{}
-		sa.streams[sf.StreamID] = buf
+		sa.streams[key] = buf
 	}
 
 	// In-order delivery: only accept data at the expected offset.
@@ -54,10 +67,11 @@ func (sa *streamAssembler) addFrame(sf streamFrame) {
 		}
 		// Gap — deliver what we have and reset.
 		if len(buf.data) > 0 && sa.callback != nil {
-			sa.callback(sf.StreamID, buf.data, false)
+			sa.callback(sf.StreamID, isServer, buf.data, false)
 			buf.data = nil
 		}
 		buf.nextOffset = sf.Offset
+		buf.fin = false // reset FIN on gap
 	}
 
 	// Append data.
@@ -73,10 +87,10 @@ func (sa *streamAssembler) addFrame(sf streamFrame) {
 	// Deliver accumulated data. For HTTP/3, we deliver incrementally
 	// since HTTP/3 frames are self-describing (have length fields).
 	if len(buf.data) > 0 && sa.callback != nil {
-		sa.callback(sf.StreamID, buf.data, buf.fin)
+		sa.callback(sf.StreamID, isServer, buf.data, buf.fin)
 		buf.data = nil
 		if buf.fin {
-			delete(sa.streams, sf.StreamID)
+			delete(sa.streams, key)
 		}
 	}
 }
@@ -84,15 +98,15 @@ func (sa *streamAssembler) addFrame(sf streamFrame) {
 // cleanup removes idle streams.
 func (sa *streamAssembler) cleanup() {
 	// Remove empty streams.
-	for id, buf := range sa.streams {
+	for key, buf := range sa.streams {
 		if len(buf.data) == 0 && buf.fin {
-			delete(sa.streams, id)
+			delete(sa.streams, key)
 		}
 	}
 	// Cap total streams.
 	if len(sa.streams) > 256 {
-		for id := range sa.streams {
-			delete(sa.streams, id)
+		for key := range sa.streams {
+			delete(sa.streams, key)
 			if len(sa.streams) <= 128 {
 				break
 			}

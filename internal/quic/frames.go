@@ -47,14 +47,15 @@ type streamFrame struct {
 
 // parseFrames parses QUIC frames from decrypted payload and returns any STREAM frames found.
 // Other frame types are skipped.
-func parseFrames(payload []byte) ([]streamFrame, error) {
+func parseFrames(payload []byte) ([]streamFrame, [][]byte, error) {
 	var streams []streamFrame
+	var newCIDs [][]byte
 	off := 0
 
 	for off < len(payload) {
 		frameType, n, err := decodeVarint(payload[off:])
 		if err != nil {
-			return streams, nil // best effort
+			return streams, newCIDs, nil // best effort
 		}
 		off += n
 
@@ -69,13 +70,13 @@ func parseFrames(payload []byte) ([]streamFrame, error) {
 
 		case frameType == frameAck || frameType == frameAckECN:
 			if err := skipACKFrame(payload[off:], &off, frameType == frameAckECN); err != nil {
-				return streams, nil
+				return streams, newCIDs, nil
 			}
 
 		case frameType >= frameStreamBase && frameType <= frameStreamBase+0x07:
 			sf, consumed, err := parseStreamFrame(payload[off:], frameType)
 			if err != nil {
-				return streams, nil
+				return streams, newCIDs, nil
 			}
 			streams = append(streams, sf)
 			off += consumed
@@ -110,7 +111,11 @@ func parseFrames(payload []byte) ([]streamFrame, error) {
 			off += vn
 
 		case frameType == frameNewConnectionID:
-			off += skipNewConnectionID(payload[off:])
+			cid, consumed := parseNewConnectionIDFrame(payload[off:])
+			off += consumed
+			if len(cid) > 0 {
+				newCIDs = append(newCIDs, cid)
+			}
 
 		case frameType == frameRetireConnectionID:
 			_, vn, _ := decodeVarint(payload[off:])
@@ -121,7 +126,7 @@ func parseFrames(payload []byte) ([]streamFrame, error) {
 
 		case frameType == frameConnectionClose || frameType == frameConnectionCloseApp:
 			// Connection closing — stop parsing.
-			return streams, nil
+			return streams, newCIDs, nil
 
 		case frameType == frameHandshakeDone:
 			// No payload.
@@ -129,11 +134,11 @@ func parseFrames(payload []byte) ([]streamFrame, error) {
 
 		default:
 			// Unknown frame type with no length — can't skip. Stop parsing.
-			return streams, nil
+			return streams, newCIDs, nil
 		}
 	}
 
-	return streams, nil
+	return streams, newCIDs, nil
 }
 
 // parseStreamFrame parses a STREAM frame body (after the type byte).
@@ -258,14 +263,21 @@ func skipNewToken(data []byte) int {
 	return pos
 }
 
-func skipNewConnectionID(data []byte) int {
+func parseNewConnectionIDFrame(data []byte) ([]byte, int) {
 	pos := 0
 	_, n, _ := decodeVarint(data[pos:]); pos += n // Sequence Number
 	_, n, _ = decodeVarint(data[pos:]); pos += n // Retire Prior To
 	if pos < len(data) {
-		connIDLen := int(data[pos]); pos++ // Length (1 byte, not varint)
-		pos += connIDLen // Connection ID
-		pos += 16 // Stateless Reset Token (16 bytes)
+		connIDLen := int(data[pos]); pos++
+		if pos+connIDLen+16 <= len(data) {
+			cid := make([]byte, connIDLen)
+			copy(cid, data[pos:pos+connIDLen])
+			pos += connIDLen
+			pos += 16 // Stateless Reset Token
+			return cid, pos
+		}
+		pos += connIDLen
+		pos += 16
 	}
-	return pos
+	return nil, pos
 }

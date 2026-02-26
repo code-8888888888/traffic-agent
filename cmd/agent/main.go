@@ -215,8 +215,9 @@ func main() {
 			}
 			qConns, qRecv, qDecrypt, qFail, qH3 := quic.QUICStats()
 			if qRecv > 0 || qConns > 0 {
-				log.Printf("[stats] QUIC: connections=%d received=%d decrypted=%d failures=%d h3_events=%d",
-					qConns, qRecv, qDecrypt, qFail, qH3)
+				log.Printf("[stats] QUIC: connections=%d received=%d decrypted=%d failures=%d h3_events=%d long_hdr=%d rev_miss=%d",
+					qConns, qRecv, qDecrypt, qFail, qH3,
+					quic.QUICLongHeaderSkipped.Load(), quic.QUICReverseMisses.Load())
 			}
 		}
 	}()

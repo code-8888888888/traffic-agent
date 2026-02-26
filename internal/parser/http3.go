@@ -16,7 +16,6 @@ package parser
 
 import (
 	"encoding/binary"
-	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -24,10 +23,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/qpack"
-
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
+
+var h3Debug = false // set to true for verbose H3 frame debug logging
+
+func firstN(b []byte, n int) []byte {
+	if len(b) < n {
+		return b
+	}
+	return b[:n]
+}
 
 // HTTP/3 frame types.
 const (
@@ -36,6 +42,14 @@ const (
 	h3FrameSettings = uint64(0x04)
 	h3FrameGoaway   = uint64(0x07)
 )
+
+// isH3BidiRequestStream returns true if the stream ID is a client-initiated
+// bidirectional stream (IDs 0, 4, 8, ...) which carry HTTP request/response
+// exchanges. Unidirectional streams (control, QPACK encoder/decoder) and
+// server-initiated streams should not have HEADERS/DATA processed.
+func isH3BidiRequestStream(streamID uint64) bool {
+	return streamID&0x3 == 0x0
+}
 
 // h3StreamInfo tracks request metadata for correlating DATA frames with HEADERS.
 type h3StreamInfo struct {
@@ -48,12 +62,19 @@ type h3StreamInfo struct {
 	gotResponse     bool
 }
 
+// h3StreamBufKey identifies a stream+direction for H3 frame buffering.
+type h3StreamBufKey struct {
+	streamID uint64
+	isServer bool
+}
+
 // h3ConnState holds per-connection HTTP/3 state.
 type h3ConnState struct {
-	qpackDecoder  *qpack.Decoder
 	activeStreams map[uint64]*h3StreamInfo
-	// Per-stream reassembly buffers for partial HTTP/3 frames.
-	streamBufs map[uint64][]byte
+	// Per-stream+direction reassembly buffers for partial HTTP/3 frames.
+	// Client and server send on independent offset spaces, so their data
+	// must be buffered separately even for the same stream ID.
+	streamBufs map[h3StreamBufKey][]byte
 	updated    time.Time
 }
 
@@ -83,7 +104,7 @@ func NewH3Parser(sink EventSink) *H3Parser {
 
 // HandleStreamData processes reassembled QUIC stream data.
 // Called by the QUIC processor's stream assembler callback.
-func (p *H3Parser) HandleStreamData(pid uint32, processName string, streamID uint64, data []byte, fin bool,
+func (p *H3Parser) HandleStreamData(pid uint32, processName string, streamID uint64, isServer bool, data []byte, fin bool,
 	srcIP, dstIP string, srcPort, dstPort uint16) {
 
 	if len(data) == 0 {
@@ -102,32 +123,47 @@ func (p *H3Parser) HandleStreamData(pid uint32, processName string, streamID uin
 	state, ok := p.conns[key]
 	if !ok {
 		state = &h3ConnState{
-			qpackDecoder:  qpack.NewDecoder(),
 			activeStreams: make(map[uint64]*h3StreamInfo),
-			streamBufs:   make(map[uint64][]byte),
+			streamBufs:   make(map[h3StreamBufKey][]byte),
 		}
 		p.conns[key] = state
+		log.Printf("[h3] new connection state: pid=%d %s:%d→%s:%d", pid, srcIP, srcPort, dstIP, dstPort)
 	}
 	state.updated = time.Now()
 
-	// Accumulate data in per-stream buffer.
-	buf := state.streamBufs[streamID]
+	// Accumulate data in per-stream+direction buffer.
+	bufKey := h3StreamBufKey{streamID: streamID, isServer: isServer}
+	buf := state.streamBufs[bufKey]
 	if len(buf)+len(data) <= maxFlowBufSize {
 		buf = append(buf, data...)
 	}
-	state.streamBufs[streamID] = buf
+	state.streamBufs[bufKey] = buf
+
+	if h3Debug {
+		dir := "C"
+		if isServer {
+			dir = "S"
+		}
+		log.Printf("[h3] stream=%d/%s len=%d buf=%d fin=%v first_bytes=%x",
+			streamID, dir, len(data), len(buf), fin, firstN(buf, 16))
+	}
 
 	// Parse as many complete HTTP/3 frames as possible.
 	var pending []*types.TrafficEvent
-	consumed := p.parseH3Frames(state, streamID, buf, pid, processName,
+	consumed := p.parseH3Frames(state, streamID, isServer, buf, pid, processName,
 		srcIP, dstIP, srcPort, dstPort,
 		func(te *types.TrafficEvent) { pending = append(pending, te) })
 
+	if h3Debug && consumed > 0 {
+		log.Printf("[h3] stream=%d/%s consumed=%d events=%d",
+			streamID, map[bool]string{true: "S", false: "C"}[isServer], consumed, len(pending))
+	}
+
 	if consumed > 0 {
-		state.streamBufs[streamID] = buf[consumed:]
+		state.streamBufs[bufKey] = buf[consumed:]
 	}
 	if fin {
-		delete(state.streamBufs, streamID)
+		delete(state.streamBufs, bufKey)
 	}
 
 	p.mu.Unlock()
@@ -139,7 +175,7 @@ func (p *H3Parser) HandleStreamData(pid uint32, processName string, streamID uin
 
 // parseH3Frames parses HTTP/3 frames from a stream buffer.
 // Returns bytes consumed.
-func (p *H3Parser) parseH3Frames(state *h3ConnState, streamID uint64, data []byte,
+func (p *H3Parser) parseH3Frames(state *h3ConnState, streamID uint64, isServer bool, data []byte,
 	pid uint32, processName, srcIP, dstIP string, srcPort, dstPort uint16,
 	emit func(*types.TrafficEvent)) int {
 
@@ -168,11 +204,17 @@ func (p *H3Parser) parseH3Frames(state *h3ConnState, streamID uint64, data []byt
 
 		switch frameType {
 		case h3FrameHeaders:
-			p.processH3Headers(state, streamID, payload, pid, processName,
-				srcIP, dstIP, srcPort, dstPort, emit)
+			// Only process HEADERS on client-initiated bidirectional streams.
+			// Unidirectional streams (control, QPACK) don't carry request/response data.
+			if isH3BidiRequestStream(streamID) {
+				p.processH3Headers(state, streamID, isServer, payload, pid, processName,
+					srcIP, dstIP, srcPort, dstPort, emit)
+			}
 		case h3FrameData:
-			p.processH3Data(state, streamID, payload, pid, processName,
-				srcIP, dstIP, srcPort, dstPort, emit)
+			if isH3BidiRequestStream(streamID) {
+				p.processH3Data(state, streamID, isServer, payload, pid, processName,
+					srcIP, dstIP, srcPort, dstPort, emit)
+			}
 		case h3FrameSettings:
 			// Settings on control stream — ignore for now.
 		case h3FrameGoaway:
@@ -186,23 +228,11 @@ func (p *H3Parser) parseH3Frames(state *h3ConnState, streamID uint64, data []byt
 }
 
 // processH3Headers QPACK-decodes a HEADERS frame and emits a TrafficEvent.
-func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, payload []byte,
+func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, isServer bool, payload []byte,
 	pid uint32, processName, srcIP, dstIP string, srcPort, dstPort uint16,
 	emit func(*types.TrafficEvent)) {
 
-	decodeFunc := state.qpackDecoder.Decode(payload)
-	var fields []qpack.HeaderField
-	for {
-		hf, err := decodeFunc()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.Printf("[h3] QPACK decode error (stream=%d): %v", streamID, err)
-			break
-		}
-		fields = append(fields, hf)
-	}
+	fields := qpackDecode(payload)
 	if len(fields) == 0 {
 		return
 	}
@@ -241,9 +271,10 @@ func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, payload
 		}
 
 		info := &h3StreamInfo{
-			method: method,
-			path:   path,
-			host:   authority,
+			method:     method,
+			path:       path,
+			host:       authority,
+			gotRequest: true,
 		}
 		state.activeStreams[streamID] = info
 
@@ -276,18 +307,21 @@ func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, payload
 		// Response HEADERS.
 		statusCode, _ := strconv.Atoi(status)
 
-		if info := state.activeStreams[streamID]; info != nil {
+		info := state.activeStreams[streamID]
+		if info != nil {
 			info.statusCode = statusCode
 			info.contentEncoding = contentEncoding
 			info.gotResponse = true
 		}
 
-		emit(&types.TrafficEvent{
+		// Swap src/dst: callback always passes canonical (client→server),
+		// but response flows server→client.
+		te := &types.TrafficEvent{
 			Timestamp:       time.Now(),
-			SrcIP:           srcIP,
-			DstIP:           dstIP,
-			SrcPort:         srcPort,
-			DstPort:         dstPort,
+			SrcIP:           dstIP,
+			DstIP:           srcIP,
+			SrcPort:         dstPort,
+			DstPort:         srcPort,
 			Protocol:        "QUIC",
 			Direction:       "ingress",
 			PID:             pid,
@@ -295,16 +329,30 @@ func (p *H3Parser) processH3Headers(state *h3ConnState, streamID uint64, payload
 			StatusCode:      statusCode,
 			ResponseHeaders: headers,
 			TLSIntercepted:  true,
-		})
+		}
+		if info != nil {
+			te.HTTPMethod = info.method
+			te.URL = info.path
+		}
+		emit(te)
 	}
 }
 
 // processH3Data handles a DATA frame.
-func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, payload []byte,
+func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, isServer bool, payload []byte,
 	pid uint32, processName, srcIP, dstIP string, srcPort, dstPort uint16,
 	emit func(*types.TrafficEvent)) {
 
 	if len(payload) == 0 {
+		return
+	}
+
+	info := state.activeStreams[streamID]
+
+	// Skip DATA frames with no corresponding HEADERS — these produce
+	// noise events with empty method/URL (e.g., from streams where we
+	// missed the initial HEADERS or from control stream data).
+	if info == nil {
 		return
 	}
 
@@ -313,32 +361,37 @@ func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, payload []
 		snippet = snippet[:types.BodySnippetMaxLen]
 	}
 
-	info := state.activeStreams[streamID]
-
 	snippetStr := string(snippet)
 	if info != nil && strings.EqualFold(info.contentEncoding, "gzip") {
 		snippetStr = decompressGzip(snippet)
 	}
 
-	te := &types.TrafficEvent{
+	// Determine direction from isServer flag (provided by QUIC stream assembler).
+	evSrcIP, evDstIP := srcIP, dstIP
+	evSrcPort, evDstPort := srcPort, dstPort
+	direction := "egress"
+	if isServer {
+		evSrcIP, evDstIP = dstIP, srcIP
+		evSrcPort, evDstPort = dstPort, srcPort
+		direction = "ingress"
+	}
+
+	emit(&types.TrafficEvent{
 		Timestamp:      time.Now(),
-		SrcIP:          srcIP,
-		DstIP:          dstIP,
-		SrcPort:        srcPort,
-		DstPort:        dstPort,
+		SrcIP:          evSrcIP,
+		DstIP:          evDstIP,
+		SrcPort:        evSrcPort,
+		DstPort:        evDstPort,
 		Protocol:       "QUIC",
-		Direction:      "ingress",
+		Direction:      direction,
 		PID:            pid,
 		ProcessName:    processName,
+		HTTPMethod:     info.method,
+		URL:            info.path,
+		StatusCode:     info.statusCode,
 		BodySnippet:    snippetStr,
 		TLSIntercepted: true,
-	}
-	if info != nil {
-		te.StatusCode = info.statusCode
-		te.URL = info.path
-		te.HTTPMethod = info.method
-	}
-	emit(te)
+	})
 }
 
 // FlushExpired removes stale H3 connection states.

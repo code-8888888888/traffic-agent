@@ -122,7 +122,7 @@ func (w *KeylogWatcher) watchLoop() {
 		select {
 		case <-w.stopCh:
 			return
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }
@@ -140,7 +140,16 @@ func (w *KeylogWatcher) readNewEntries(offset int64) ([]keylogEntry, int64) {
 	}
 	defer f.Close()
 
+	// Handle file truncation (e.g., `> keylog.txt`): if the file is
+	// smaller than our offset, start reading from the beginning.
 	if offset > 0 {
+		fi, err := f.Stat()
+		if err != nil {
+			return nil, offset
+		}
+		if fi.Size() < offset {
+			offset = 0
+		}
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return nil, offset
 		}
