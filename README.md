@@ -641,69 +641,64 @@ Multiple concurrent subscribers are supported; each receives all events independ
 
 ## Reading Captured Events
 
-The `scripts/read-events.py` script reconstructs full HTTP responses from the captured `events.json` file. It extracts SSE `content_block_delta` tokens and reassembles them into the complete response text.
+Three Python scripts in `scripts/` reconstruct full HTTP responses from the captured `events.json` file. They extract SSE `content_block_delta` tokens and reassemble them into the complete response text.
+
+| Script | Source | API endpoint |
+|--------|--------|-------------|
+| `read-events-cli.py` | Claude CLI (Claude Code) | `/v1/messages` |
+| `read-events-browser.py` | Browser (claude.ai) | `/completion` |
+| `read-events.py` | Generic (any URL) | configurable via `--url` |
+
+> **Note:** `events.json` is root-owned (the agent runs as root). Use `sudo` to read it, or adjust file permissions in the output config.
 
 ### CLI capture (Claude Code)
 
-**Requirements for Claude CLI capture:**
+```bash
+# Last CLI response
+sudo python3 scripts/read-events-cli.py -f events.json
+
+# All CLI responses
+sudo python3 scripts/read-events-cli.py -f events.json --all
+
+# Show raw event details
+sudo python3 scripts/read-events-cli.py -f events.json --raw
+```
+
+**Requirements:**
 
 - **BoringSSL offsets required** — Claude CLI (Bun runtime) statically links a stripped BoringSSL. The `tls.boringssl_executables` config must have the correct `ssl_write_offset` and `ssl_read_offset` for your installed version. These offsets are version-specific and must be updated when the Claude CLI binary is upgraded.
-- **`events.json` is root-owned** — Use `sudo` to read it, or adjust file permissions in the output config.
+
+### Browser capture (Firefox / claude.ai)
 
 ```bash
-# Read the last Claude CLI response
-sudo python3 scripts/read-events.py -f events.json
+# Last browser response
+sudo python3 scripts/read-events-browser.py -f events.json
+
+# All browser responses
+sudo python3 scripts/read-events-browser.py -f events.json --all
+
+# Show raw event details (before deduplication)
+sudo python3 scripts/read-events-browser.py -f events.json --raw
 ```
 
-### Basic usage
-
-```bash
-# Show the last captured response (default: filters to /v1/messages)
-python3 scripts/read-events.py
-
-# Show all captured responses
-python3 scripts/read-events.py --all
-
-# Use a custom events file
-python3 scripts/read-events.py -f /var/log/traffic-agent/events.json
-```
-
-### Filtering
-
-```bash
-# Filter by URL pattern
-python3 scripts/read-events.py --url /v1/messages
-python3 scripts/read-events.py --url /api/chat
-
-# Show all events without URL filtering
-python3 scripts/read-events.py --no-filter
-```
-
-### Detailed output
-
-```bash
-# Show raw event details (all individual SSE chunks)
-python3 scripts/read-events.py --raw
-```
-
-### Browser capture (Firefox)
-
-The script also works with traffic captured from Firefox (e.g., claude.ai). Use a broader URL filter since the browser uses different API paths than the CLI:
-
-```bash
-# Claude.ai browser traffic
-sudo python3 scripts/read-events.py -f events.json --url /api/
-
-# All captured traffic regardless of URL
-sudo python3 scripts/read-events.py -f events.json --no-filter --all
-```
-
-**Requirements for browser capture:**
+**Requirements:**
 
 - **Firefox only** — Chromium's statically-linked BoringSSL is stripped and not configured for interception by default.
 - **QUIC auto-disabled** — The agent writes `user.js` to Firefox profiles on startup to disable QUIC/HTTP3, forcing all HTTPS through HTTP/2 over TLS which the NSS uprobes can capture.
 - **Firefox restart required** — Firefox must be (re)started after the agent starts for the `user.js` QUIC disable to take effect.
-- **`events.json` is root-owned** — Use `sudo` to read it, or adjust file permissions in the output config.
+
+**How it works:** The browser uses HTTP/2 over TLS. Due to H2 mid-connection joins (the agent may attach after the H2 handshake), SSE response chunks arrive as DATA frames without URL metadata. The browser script collects these URL-less SSE events and correlates them with the `POST /completion` request. NSS read+return probes both capture the same SSL_read data, so the script deduplicates using a sliding window.
+
+### Generic event reader
+
+```bash
+# Filter by any URL pattern
+sudo python3 scripts/read-events.py --url /v1/messages
+sudo python3 scripts/read-events.py --url /api/chat
+
+# All events without URL filtering
+sudo python3 scripts/read-events.py --no-filter --all
+```
 
 ### Example output
 
