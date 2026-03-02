@@ -11,7 +11,8 @@
       "Bash(grep:*)",
       "Bash(head:*)",
       "Bash(ip link show)",
-      "Bash(ip:*)"
+      "Bash(ip:*)",
+      "Bash(sudo strings:*)"
     ]
   }
 }
