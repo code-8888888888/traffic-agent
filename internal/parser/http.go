@@ -44,6 +44,8 @@ var (
 	sslEventsH1Path    atomic.Int64
 	sslEventsSkipped   atomic.Int64
 	sslBodyHits        atomic.Int64 // SSL events with notable HTTP content
+	sseStreamsCreated   atomic.Int64
+	sseChunksEmitted   atomic.Int64
 )
 
 // sslContentPatterns are substrings scanned in raw SSL event data for diagnostics.
@@ -78,6 +80,34 @@ type sslFlowKey struct {
 	IsRead bool
 }
 
+// sslConnKey identifies an SSL connection (direction-independent).
+type sslConnKey struct {
+	PID    uint32
+	ConnID uint64
+}
+
+// sslRequestMeta stores the last request metadata per SSL connection,
+// enabling request→response correlation for SSE streams.
+type sslRequestMeta struct {
+	method  string
+	url     string
+	host    string
+	updated time.Time
+}
+
+// sseStream tracks an active SSE (text/event-stream) response.
+type sseStream struct {
+	method          string
+	url             string
+	host            string
+	statusCode      int
+	processName     string
+	contentEncoding string // gzip, br, zstd, deflate
+	compressedBuf   []byte // accumulated compressed data for streaming decompression
+	decompOffset    int    // bytes already emitted from decompressed stream
+	updated         time.Time
+}
+
 type flowBuf struct {
 	data          []byte
 	updated       time.Time
@@ -86,22 +116,26 @@ type flowBuf struct {
 
 // Parser accumulates per-flow payloads and emits HTTP traffic events.
 type Parser struct {
-	sink     EventSink
-	mu       sync.Mutex
-	bufs     map[flowKey]*flowBuf
-	sslBufs  map[sslFlowKey]*flowBuf
-	h2Conns  map[h2ConnKey]*h2ConnState // HTTP/2 connection states keyed by (PID,TID,ConnID) or 4-tuple
-	h2cFlows map[flowKey]bool           // TC flows identified as h2c (fast lookup)
+	sink       EventSink
+	mu         sync.Mutex
+	bufs       map[flowKey]*flowBuf
+	sslBufs    map[sslFlowKey]*flowBuf
+	h2Conns    map[h2ConnKey]*h2ConnState // HTTP/2 connection states keyed by (PID,TID,ConnID) or 4-tuple
+	h2cFlows   map[flowKey]bool           // TC flows identified as h2c (fast lookup)
+	sslReqMeta map[sslConnKey]*sslRequestMeta // last request per SSL conn (for SSE correlation)
+	sseStreams map[sslConnKey]*sseStream       // active SSE response streams
 }
 
 // New creates a Parser that will call sink for each parsed HTTP event.
 func New(sink EventSink) *Parser {
 	return &Parser{
-		sink:     sink,
-		bufs:     make(map[flowKey]*flowBuf),
-		sslBufs:  make(map[sslFlowKey]*flowBuf),
-		h2Conns:  make(map[h2ConnKey]*h2ConnState),
-		h2cFlows: make(map[flowKey]bool),
+		sink:       sink,
+		bufs:       make(map[flowKey]*flowBuf),
+		sslBufs:    make(map[sslFlowKey]*flowBuf),
+		h2Conns:    make(map[h2ConnKey]*h2ConnState),
+		h2cFlows:   make(map[flowKey]bool),
+		sslReqMeta: make(map[sslConnKey]*sslRequestMeta),
+		sseStreams: make(map[sslConnKey]*sseStream),
 	}
 }
 
@@ -254,6 +288,81 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		return
 	}
 
+	// ---- SSE stream continuation check ----
+	//
+	// If this SSL read belongs to an active SSE (text/event-stream) response,
+	// emit the raw SSE data as a body-only TrafficEvent with stored metadata.
+	// This mirrors how H2 DATA frames are emitted per-chunk with stream info.
+	if ev.IsRead {
+		ck := sslConnKey{PID: ev.PID, ConnID: ev.ConnID}
+		p.mu.Lock()
+		sse := p.sseStreams[ck]
+		p.mu.Unlock()
+
+		if sse != nil {
+			if bytes.HasPrefix(ev.Data, []byte("HTTP/")) {
+				// New HTTP response on same connection — SSE stream ended
+				// (connection reuse). Delete and fall through to normal parsing.
+				p.mu.Lock()
+				delete(p.sseStreams, ck)
+				p.mu.Unlock()
+			} else {
+				// Decode the raw SSL_read data: strip chunked TE framing,
+				// then decompress using accumulated compressed buffer.
+				body := dechunkData(ev.Data)
+
+				p.mu.Lock()
+				sse.updated = time.Now()
+
+				if len(body) == 0 {
+					// Terminal chunk (0\r\n\r\n) or framing-only data.
+					p.mu.Unlock()
+					return
+				}
+
+				var snippet string
+				if sse.contentEncoding != "" && sse.contentEncoding != "identity" {
+					// Streaming decompression: accumulate compressed bytes,
+					// decompress from start, skip already-emitted bytes.
+					const maxCompBuf = 256 * 1024
+					if len(sse.compressedBuf)+len(body) <= maxCompBuf {
+						sse.compressedBuf = append(sse.compressedBuf, body...)
+					}
+					snippet = decompressBodyAt(sse.compressedBuf, sse.contentEncoding, sse.decompOffset)
+					if snippet != "" && !strings.HasPrefix(snippet, "<") {
+						sse.decompOffset += len(snippet)
+					}
+				} else {
+					snippet = string(body)
+					if len(snippet) > types.BodySnippetMaxLen {
+						snippet = snippet[:types.BodySnippetMaxLen]
+					}
+				}
+				p.mu.Unlock()
+
+				if len(strings.TrimSpace(snippet)) == 0 {
+					return
+				}
+
+				sseChunksEmitted.Add(1)
+				sslEventsH1Path.Add(1)
+				p.sink(&types.TrafficEvent{
+					Timestamp:      time.Now(),
+					Protocol:       "TLS",
+					Direction:      "ingress",
+					PID:            ev.PID,
+					ProcessName:    sse.processName,
+					HTTPMethod:     sse.method,
+					URL:            sse.url,
+					StatusCode:     sse.statusCode,
+					BodySnippet:    snippet,
+					TLSIntercepted: true,
+				})
+				return
+			}
+		}
+	}
+
 	// ---- HTTP/1.1 path ----
 	//
 	// Try parsing the current event's data alone first.  This handles the
@@ -268,7 +377,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 
 	if te := p.tryParseSSLData(ev.Data, ev); te != nil {
 		sslEventsH1Path.Add(1)
-		p.sink(te)
+		p.emitSSLEventWithTracking(te, ev)
 		return
 	}
 
@@ -310,9 +419,79 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 
 	if te := p.tryParseSSLData(data, ev); te != nil {
 		sslEventsH1Path.Add(1)
-		p.sink(te)
+		p.emitSSLEventWithTracking(te, ev)
 		p.deleteSSLBuf(key)
 	}
+}
+
+// emitSSLEventWithTracking sinks the TrafficEvent and updates SSE tracking:
+//   - For writes (requests): stores method/URL/host for request→response correlation.
+//   - For reads (responses): if Content-Type is text/event-stream, registers an
+//     SSE stream so subsequent SSL_reads emit chunks with the stored metadata.
+func (p *Parser) emitSSLEventWithTracking(te *types.TrafficEvent, ev *types.SSLEvent) {
+	ck := sslConnKey{PID: ev.PID, ConnID: ev.ConnID}
+
+	if !ev.IsRead && te.HTTPMethod != "" {
+		// Track the most recent request on this SSL connection.
+		p.mu.Lock()
+		p.sslReqMeta[ck] = &sslRequestMeta{
+			method:  te.HTTPMethod,
+			url:     te.URL,
+			host:    te.RequestHeaders["Host"],
+			updated: time.Now(),
+		}
+		p.mu.Unlock()
+	}
+
+	if ev.IsRead && te.StatusCode > 0 {
+		// Check if this response starts an SSE stream.
+		ct := te.ResponseHeaders["Content-Type"]
+		if strings.Contains(strings.ToLower(ct), "text/event-stream") {
+			p.mu.Lock()
+			reqMeta := p.sslReqMeta[ck]
+			ce := strings.ToLower(strings.TrimSpace(te.ResponseHeaders["Content-Encoding"]))
+			sse := &sseStream{
+				statusCode:      te.StatusCode,
+				processName:     ev.ProcessName,
+				contentEncoding: ce,
+				updated:         time.Now(),
+			}
+			// Seed the compressed buffer from the initial SSL_read's raw body.
+			// The raw data has HTTP headers followed by the body (possibly
+			// chunked + compressed). Extract body after \r\n\r\n and dechunk.
+			if ce != "" && ce != "identity" {
+				if sep := bytes.Index(ev.Data, []byte("\r\n\r\n")); sep >= 0 {
+					rawBody := ev.Data[sep+4:]
+					sse.compressedBuf = dechunkData(rawBody)
+					// The initial response's body was already decompressed
+					// by http.ReadResponse, so set decompOffset to skip it.
+					if len(te.BodySnippet) > 0 {
+						sse.decompOffset = len(te.BodySnippet)
+					}
+				}
+			}
+			if reqMeta != nil {
+				sse.method = reqMeta.method
+				sse.url = reqMeta.url
+				sse.host = reqMeta.host
+				// Enrich the initial response event with request metadata.
+				te.HTTPMethod = reqMeta.method
+				te.URL = reqMeta.url
+			}
+			p.sseStreams[ck] = sse
+			p.mu.Unlock()
+			sseStreamsCreated.Add(1)
+			log.Printf("[sse] stream started pid=%d conn=0x%x method=%s url=%s status=%d",
+				ev.PID, ev.ConnID, sse.method, sse.url, sse.statusCode)
+		}
+	}
+
+	p.sink(te)
+}
+
+// SSEStreamStats returns SSE diagnostic counters.
+func SSEStreamStats() (streams, chunks int64) {
+	return sseStreamsCreated.Load(), sseChunksEmitted.Load()
 }
 
 // tryParseSSLData attempts to parse data as an HTTP/1.1 request or response
@@ -377,6 +556,16 @@ func (p *Parser) FlushExpired(flowTimeout, h2Timeout time.Duration) {
 	for key, fb := range p.sslBufs {
 		if fb.updated.Before(flowCutoff) {
 			delete(p.sslBufs, key)
+		}
+	}
+	for key, rm := range p.sslReqMeta {
+		if rm.updated.Before(flowCutoff) {
+			delete(p.sslReqMeta, key)
+		}
+	}
+	for key, sse := range p.sseStreams {
+		if sse.updated.Before(flowCutoff) {
+			delete(p.sseStreams, key)
 		}
 	}
 	h2Expired := 0
@@ -778,6 +967,48 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 		headers:    headersToMap(resp.Header),
 		body:       body,
 	}, true
+}
+
+// dechunkData strips HTTP chunked Transfer-Encoding framing from data.
+// Input: "<hex-size>\r\n<data>\r\n[<hex-size>\r\n<data>\r\n]..."
+// Returns the concatenated payload with chunk framing removed.
+// If the data doesn't look chunked, returns it as-is.
+func dechunkData(data []byte) []byte {
+	// Quick check: chunked data starts with hex digits followed by \r\n.
+	crlfIdx := bytes.Index(data, []byte("\r\n"))
+	if crlfIdx <= 0 || crlfIdx > 8 {
+		return data // doesn't look chunked
+	}
+	// Parse the hex size.
+	sizeStr := strings.TrimSpace(string(data[:crlfIdx]))
+	var chunkSize int
+	if _, err := fmt.Sscanf(sizeStr, "%x", &chunkSize); err != nil {
+		return data // not a valid chunk header
+	}
+	if chunkSize == 0 {
+		return nil // terminal chunk
+	}
+	start := crlfIdx + 2
+	if start+chunkSize > len(data) {
+		// Chunk extends beyond data — take what we have.
+		return data[start:]
+	}
+	// Collect this chunk's payload, then try to parse more chunks.
+	var result []byte
+	result = append(result, data[start:start+chunkSize]...)
+	rest := data[start+chunkSize:]
+	// Skip trailing \r\n after chunk data.
+	if len(rest) >= 2 && rest[0] == '\r' && rest[1] == '\n' {
+		rest = rest[2:]
+	}
+	// Recursively parse remaining chunks (typically 0-2 more in an SSL record).
+	if len(rest) > 0 {
+		more := dechunkData(rest)
+		if more != nil {
+			result = append(result, more...)
+		}
+	}
+	return result
 }
 
 // decompressBody attempts to decompress data according to the given

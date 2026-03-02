@@ -207,6 +207,10 @@ func main() {
 					log.Printf("[stats] H2/TLS: data_frames=%d hpack_errors=%d events_emitted=%d",
 						h2df, h2he, h2ee)
 				}
+				sseStreams, sseChunks := parser.SSEStreamStats()
+				if sseStreams > 0 || sseChunks > 0 {
+					log.Printf("[stats] SSE: streams=%d chunks=%d", sseStreams, sseChunks)
+				}
 				mcj, hexp := parser.H2StateStats()
 				if mcj > 0 || hexp > 0 {
 					log.Printf("[stats] H2 state: mid_conn_joins=%d states_expired=%d active=%d",
