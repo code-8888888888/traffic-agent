@@ -2,6 +2,7 @@ bin/
 *.o
 index.html*
 traffic-agent
+agent
 events.json
 stderr.log
 agent.log
