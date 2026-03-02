@@ -16,6 +16,7 @@
 package browser
 
 import (
+	"bufio"
 	"fmt"
 	"log"
 	"os"
@@ -37,6 +38,11 @@ const (
 // ConfigureFirefox discovers all Firefox profiles for the real (non-root)
 // user and disables QUIC by writing a user.js preference block.
 //
+// Profiles are discovered by parsing profiles.ini (not by scanning
+// directories), ensuring only active profiles are configured. Both
+// regular (~/.mozilla/firefox/) and snap (~/snap/firefox/common/.mozilla/
+// firefox/) locations are checked.
+//
 // When the agent runs via sudo, SUDO_USER is used to find the correct
 // home directory and file ownership is preserved.
 //
@@ -47,30 +53,19 @@ func ConfigureFirefox() (int, error) {
 		return 0, fmt.Errorf("resolve user home: %w", err)
 	}
 
-	profilesDir := filepath.Join(homeDir, ".mozilla", "firefox")
-	entries, err := os.ReadDir(profilesDir)
-	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", profilesDir, err)
+	profileDirs := discoverFirefoxProfiles(homeDir)
+	if len(profileDirs) == 0 {
+		return 0, fmt.Errorf("no Firefox profiles found in profiles.ini")
 	}
 
 	configured := 0
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		profileDir := filepath.Join(profilesDir, e.Name())
-
-		// Only configure profiles that have been used (prefs.js exists).
-		if _, err := os.Stat(filepath.Join(profileDir, "prefs.js")); err != nil {
-			continue
-		}
-
+	for _, profileDir := range profileDirs {
 		if err := writeQUICDisable(profileDir, uid, gid); err != nil {
-			log.Printf("[browser] profile %s: %v", e.Name(), err)
+			log.Printf("[browser] profile %s: %v", filepath.Base(profileDir), err)
 			continue
 		}
 		configured++
-		log.Printf("[browser] Firefox profile %s: QUIC disabled via user.js", e.Name())
+		log.Printf("[browser] Firefox profile %s: QUIC disabled via user.js", filepath.Base(profileDir))
 	}
 
 	// Warn if Firefox is currently running — change takes effect on next launch.
@@ -83,30 +78,155 @@ func ConfigureFirefox() (int, error) {
 
 // RestoreFirefox removes the traffic-agent QUIC-disable block from all
 // Firefox profiles found in the real user's home directory.
+//
+// For restore, we scan both profiles.ini AND all directories (to clean up
+// any stale user.js entries from before the profiles.ini fix).
 func RestoreFirefox() {
 	homeDir, _, _, err := resolveRealUser()
 	if err != nil {
 		return
 	}
 
-	profilesDir := filepath.Join(homeDir, ".mozilla", "firefox")
-	entries, err := os.ReadDir(profilesDir)
-	if err != nil {
-		return
+	// Collect profile dirs from profiles.ini + directory scan (union).
+	seen := make(map[string]bool)
+	var profileDirs []string
+
+	for _, dir := range discoverFirefoxProfiles(homeDir) {
+		if !seen[dir] {
+			seen[dir] = true
+			profileDirs = append(profileDirs, dir)
+		}
 	}
 
-	for _, e := range entries {
-		if !e.IsDir() {
+	// Also scan directories to clean up any stale user.js from before the fix.
+	for _, rootDir := range firefoxRootDirs(homeDir) {
+		entries, err := os.ReadDir(rootDir)
+		if err != nil {
 			continue
 		}
-		profileDir := filepath.Join(profilesDir, e.Name())
-		removed, err := removeQUICDisable(profileDir)
-		if err != nil {
-			log.Printf("[browser] restore profile %s: %v", e.Name(), err)
-		} else if removed {
-			log.Printf("[browser] Firefox profile %s: QUIC restored", e.Name())
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			dir := filepath.Join(rootDir, e.Name())
+			if !seen[dir] {
+				seen[dir] = true
+				profileDirs = append(profileDirs, dir)
+			}
 		}
 	}
+
+	for _, profileDir := range profileDirs {
+		removed, err := removeQUICDisable(profileDir)
+		if err != nil {
+			log.Printf("[browser] restore profile %s: %v", filepath.Base(profileDir), err)
+		} else if removed {
+			log.Printf("[browser] Firefox profile %s: QUIC restored", filepath.Base(profileDir))
+		}
+	}
+}
+
+// firefoxRootDirs returns the Firefox profile root directories to check.
+// Regular Firefox uses ~/.mozilla/firefox/, snap Firefox uses
+// ~/snap/firefox/common/.mozilla/firefox/.
+func firefoxRootDirs(homeDir string) []string {
+	return []string{
+		filepath.Join(homeDir, ".mozilla", "firefox"),
+		filepath.Join(homeDir, "snap", "firefox", "common", ".mozilla", "firefox"),
+	}
+}
+
+// discoverFirefoxProfiles parses profiles.ini in all known Firefox root
+// directories and returns the absolute paths of all listed profile dirs.
+func discoverFirefoxProfiles(homeDir string) []string {
+	seen := make(map[string]bool)
+	var dirs []string
+
+	for _, rootDir := range firefoxRootDirs(homeDir) {
+		iniPath := filepath.Join(rootDir, "profiles.ini")
+		profiles := parseProfilesINI(iniPath, rootDir)
+		for _, p := range profiles {
+			if !seen[p] {
+				seen[p] = true
+				dirs = append(dirs, p)
+			}
+		}
+	}
+	return dirs
+}
+
+// parseProfilesINI reads a Firefox profiles.ini file and returns the
+// absolute paths of all [ProfileN] entries that point to existing directories.
+//
+// The INI format contains sections like:
+//
+//	[Profile0]
+//	Name=default
+//	IsRelative=1
+//	Path=abc123.default
+//	Default=1
+//
+// IsRelative=1 means Path is relative to the directory containing profiles.ini.
+// IsRelative=0 means Path is an absolute filesystem path.
+func parseProfilesINI(iniPath, rootDir string) []string {
+	f, err := os.Open(iniPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var profiles []string
+	var inProfile bool
+	var path string
+	isRelative := true
+
+	flush := func() {
+		if !inProfile || path == "" {
+			inProfile = false
+			path = ""
+			isRelative = true
+			return
+		}
+		var absPath string
+		if isRelative {
+			absPath = filepath.Join(rootDir, path)
+		} else {
+			absPath = path
+		}
+		// Only include profiles whose directory actually exists.
+		if info, err := os.Stat(absPath); err == nil && info.IsDir() {
+			profiles = append(profiles, absPath)
+		}
+		inProfile = false
+		path = ""
+		isRelative = true
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		// New section header.
+		if strings.HasPrefix(line, "[") {
+			flush()
+			// Only process [ProfileN] sections.
+			inProfile = strings.HasPrefix(line, "[Profile")
+			continue
+		}
+
+		if !inProfile {
+			continue
+		}
+
+		if strings.HasPrefix(line, "Path=") {
+			path = strings.TrimPrefix(line, "Path=")
+		} else if strings.HasPrefix(line, "IsRelative=") {
+			isRelative = strings.TrimPrefix(line, "IsRelative=") == "1"
+		}
+	}
+	flush() // handle last section
+
+	return profiles
 }
 
 // writeQUICDisable appends (or confirms) the QUIC-disable block in user.js.
