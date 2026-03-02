@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/traffic-agent/traffic-agent/internal/browser"
 	"github.com/traffic-agent/traffic-agent/internal/capture"
 	"github.com/traffic-agent/traffic-agent/internal/config"
 	"github.com/traffic-agent/traffic-agent/internal/filter"
@@ -141,6 +142,19 @@ func main() {
 			capture.PurgeProcCache()
 		}
 	}()
+
+	// ---- Auto-configure browsers (disable QUIC for TLS interception) ----
+	if cfg.TLS.Enabled && cfg.Browser.ShouldDisableQUIC() {
+		if browser.IsFirefoxInstalled() {
+			n, err := browser.ConfigureFirefox()
+			if err != nil {
+				log.Printf("[main] Firefox auto-config: %v", err)
+			} else if n > 0 {
+				log.Printf("[main] Firefox: QUIC disabled in %d profile(s) — HTTP/2 over TLS will be used", n)
+				defer browser.RestoreFirefox()
+			}
+		}
+	}
 
 	// ---- Start TLS interceptor (optional) ----
 	if cfg.TLS.Enabled {

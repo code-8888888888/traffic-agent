@@ -375,10 +375,11 @@ func (p *H3Parser) processH3Data(state *h3ConnState, streamID uint64, isServer b
 		reqBody = reqBody[:types.RequestBodyMaxLen]
 	}
 
-	snippetStr := string(snippet)
-	if info != nil && strings.EqualFold(info.contentEncoding, "gzip") {
-		snippetStr = decompressGzip(snippet)
+	encoding := ""
+	if info != nil {
+		encoding = info.contentEncoding
 	}
+	snippetStr := decompressBody(snippet, encoding)
 
 	// Determine direction from isServer flag (provided by QUIC stream assembler).
 	evSrcIP, evDstIP := srcIP, dstIP

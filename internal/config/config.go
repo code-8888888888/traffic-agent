@@ -19,10 +19,11 @@ type Config struct {
 	// Ports lists the TCP ports to capture. Defaults to [80, 443, 8080, 8443].
 	Ports []int `yaml:"ports"`
 
-	Filter      FilterConfig `yaml:"filter"`
-	Output      OutputConfig `yaml:"output"`
-	TLS         TLSConfig    `yaml:"tls"`
-	EventStream StreamConfig `yaml:"event_stream"`
+	Filter      FilterConfig  `yaml:"filter"`
+	Output      OutputConfig  `yaml:"output"`
+	TLS         TLSConfig     `yaml:"tls"`
+	Browser     BrowserConfig `yaml:"browser"`
+	EventStream StreamConfig  `yaml:"event_stream"`
 }
 
 // FilterConfig defines traffic filtering rules. Empty/zero values mean "match all".
@@ -117,6 +118,25 @@ type StreamConfig struct {
 	Address string `yaml:"address"`
 	// Path is the HTTP path for the event stream (e.g. "/events").
 	Path string `yaml:"path"`
+}
+
+// BrowserConfig controls automatic browser configuration for traffic
+// interception. When enabled, the agent configures browsers to use
+// protocols that can be intercepted by eBPF uprobes.
+type BrowserConfig struct {
+	// DisableQUIC automatically disables QUIC/HTTP3 in detected browsers
+	// so they fall back to HTTP/2 over TLS (which NSS/OpenSSL uprobes capture).
+	// Default: true when TLS interception is enabled.
+	DisableQUIC *bool `yaml:"disable_quic"`
+}
+
+// ShouldDisableQUIC returns true if browser QUIC should be disabled.
+// Defaults to true (nil pointer = default enabled).
+func (b BrowserConfig) ShouldDisableQUIC() bool {
+	if b.DisableQUIC == nil {
+		return true
+	}
+	return *b.DisableQUIC
 }
 
 // Load reads and parses the YAML config file at path.

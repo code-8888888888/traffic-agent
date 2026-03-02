@@ -105,7 +105,16 @@ type h2StreamInfo struct {
 	path            string
 	host            string
 	statusCode      int    // from response HEADERS
-	contentEncoding string // for gzip decompression
+	contentEncoding string // for decompression (gzip, br, zstd, deflate)
+
+	// compressedBuf accumulates compressed DATA frame payloads for
+	// streaming decompression.  Capped at 64 KB to prevent unbounded growth.
+	compressedBuf []byte
+
+	// decompOffset tracks how many decompressed bytes have already been
+	// emitted, so subsequent DATA frames show NEW content rather than
+	// repeating the beginning.
+	decompOffset int
 }
 
 // h2ConnState holds per-connection HTTP/2 decode state.
@@ -658,9 +667,19 @@ func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, streamID ui
 	}
 
 	// Save response metadata in activeStreams for DATA frame enrichment.
+	// Create an entry if one doesn't exist (e.g., mid-connection join where
+	// request HEADERS were missed due to stale HPACK table).
+	if s.activeStreams == nil {
+		s.activeStreams = make(map[uint32]*h2StreamInfo)
+	}
 	if info := s.activeStreams[streamID]; info != nil {
 		info.statusCode = statusCode
 		info.contentEncoding = contentEncoding
+	} else {
+		s.activeStreams[streamID] = &h2StreamInfo{
+			statusCode:      statusCode,
+			contentEncoding: contentEncoding,
+		}
 	}
 
 	emit(&types.TrafficEvent{
@@ -768,9 +787,26 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		emit(te)
 	} else {
 		// Ingress DATA: enrich with response metadata from HEADERS.
-		snippetStr := string(snippet)
-		if info != nil && strings.EqualFold(info.contentEncoding, "gzip") {
-			snippetStr = decompressGzip(snippet)
+		encoding := ""
+		if info != nil {
+			encoding = info.contentEncoding
+		}
+
+		snippetStr := ""
+		if encoding != "" && encoding != "identity" && info != nil {
+			// Compressed body: accumulate DATA payloads and decompress
+			// the full buffer to handle multi-frame compressed streams.
+			// Skip already-emitted bytes so each DATA frame shows NEW content.
+			const maxCompBuf = 64 * 1024
+			if len(info.compressedBuf)+len(body) <= maxCompBuf {
+				info.compressedBuf = append(info.compressedBuf, body...)
+			}
+			snippetStr = decompressBodyAt(info.compressedBuf, encoding, info.decompOffset)
+			if snippetStr != "" && !strings.HasPrefix(snippetStr, "<") {
+				info.decompOffset += len(snippetStr)
+			}
+		} else {
+			snippetStr = string(snippet)
 		}
 
 		te := &types.TrafficEvent{

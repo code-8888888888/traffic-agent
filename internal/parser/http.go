@@ -19,6 +19,7 @@ package parser
 import (
 	"bufio"
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -28,6 +29,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/zstd"
 
 	"github.com/traffic-agent/traffic-agent/internal/types"
 )
@@ -751,11 +755,7 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 
 	body := ""
 	if bodyN > 0 {
-		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
-			body = decompressGzip(allBody)
-		} else {
-			body = string(allBody)
-		}
+		body = decompressBody(allBody, resp.Header.Get("Content-Encoding"))
 	}
 
 	return &httpResponseFields{
@@ -765,19 +765,106 @@ func parseHTTPResponseFields(data []byte) (*httpResponseFields, bool) {
 	}, true
 }
 
-// decompressGzip attempts to decompress gzip-encoded data and returns up to
-// BodySnippetMaxLen bytes of the decompressed content as a string.
-// Returns "<gzip-compressed>" if the data cannot be decompressed.
-func decompressGzip(data []byte) string {
-	gr, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return "<gzip-compressed>"
+// decompressBody attempts to decompress data according to the given
+// Content-Encoding value. Supports gzip, br (Brotli), zstd, and deflate.
+// Returns the original data as a string if encoding is empty or unknown,
+// or a placeholder if decompression fails.
+func decompressBody(data []byte, encoding string) string {
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	if encoding == "" || encoding == "identity" {
+		return string(data)
 	}
-	defer gr.Close()
+
+	var reader io.Reader
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return "<gzip-error>"
+		}
+		defer gr.Close()
+		reader = gr
+	case "br":
+		reader = brotli.NewReader(bytes.NewReader(data))
+	case "zstd":
+		zr, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return "<zstd-error>"
+		}
+		defer zr.Close()
+		reader = zr
+	case "deflate":
+		fr := flate.NewReader(bytes.NewReader(data))
+		defer fr.Close()
+		reader = fr
+	default:
+		return string(data)
+	}
+
 	out := make([]byte, types.BodySnippetMaxLen)
-	n, err := io.ReadAtLeast(gr, out, 1)
+	n, err := io.ReadAtLeast(reader, out, 1)
 	if err != nil && n == 0 {
-		return "<gzip-compressed>"
+		return fmt.Sprintf("<%s-compressed>", encoding)
+	}
+	return string(out[:n])
+}
+
+// decompressBodyAt decompresses accumulated data starting at a byte offset
+// into the decompressed output.  This allows incremental decompression across
+// multiple HTTP/2 DATA frames — each call skips already-emitted bytes and
+// returns only NEW decompressed content (up to BodySnippetMaxLen).
+func decompressBodyAt(data []byte, encoding string, offset int) string {
+	encoding = strings.ToLower(strings.TrimSpace(encoding))
+	if encoding == "" || encoding == "identity" {
+		if offset >= len(data) {
+			return ""
+		}
+		end := offset + types.BodySnippetMaxLen
+		if end > len(data) {
+			end = len(data)
+		}
+		return string(data[offset:end])
+	}
+
+	var reader io.Reader
+	switch encoding {
+	case "gzip":
+		gr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return ""
+		}
+		defer gr.Close()
+		reader = gr
+	case "br":
+		reader = brotli.NewReader(bytes.NewReader(data))
+	case "zstd":
+		zr, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return ""
+		}
+		defer zr.Close()
+		reader = zr
+	case "deflate":
+		fr := flate.NewReader(bytes.NewReader(data))
+		defer fr.Close()
+		reader = fr
+	default:
+		return ""
+	}
+
+	// Skip past already-emitted decompressed bytes.
+	if offset > 0 {
+		skipped, err := io.CopyN(io.Discard, reader, int64(offset))
+		if err != nil || int(skipped) < offset {
+			return ""
+		}
+	}
+
+	// Read new decompressed content.
+	out := make([]byte, types.BodySnippetMaxLen)
+	n, err := io.ReadAtLeast(reader, out, 1)
+	if err != nil && n == 0 {
+		return ""
 	}
 	return string(out[:n])
 }

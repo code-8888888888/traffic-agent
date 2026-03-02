@@ -65,6 +65,17 @@ output:
   compress: false
 
 # -----------------------------------------------------------------------
+# Browser auto-configuration
+# -----------------------------------------------------------------------
+browser:
+  # Automatically disable QUIC/HTTP3 in detected browsers so all HTTPS
+  # traffic goes through HTTP/2 over TLS (interceptable by NSS uprobes).
+  # The agent writes user.js to Firefox profiles on startup and removes
+  # it on shutdown. Firefox must be (re)started after the agent for this
+  # to take effect. Default: true when tls.enabled is true.
+  disable_quic: true
+
+# -----------------------------------------------------------------------
 # TLS / SSL plaintext interception via eBPF uprobes
 # -----------------------------------------------------------------------
 tls:
