@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,9 +26,17 @@ import (
 // sslDropCount tracks SSL events dropped because the Go channel was full.
 var sslDropCount atomic.Uint64
 
+// sslDedupCount tracks SSL events suppressed by deduplication.
+var sslDedupCount atomic.Uint64
+
 // SSLDropCountReset returns the current SSL drop count and resets it to zero.
 func SSLDropCountReset() uint64 {
 	return sslDropCount.Swap(0)
+}
+
+// SSLDedupCountReset returns the current dedup count and resets it to zero.
+func SSLDedupCountReset() uint64 {
+	return sslDedupCount.Swap(0)
 }
 
 // maxSSLDataSize must match MAX_SSL_DATA_SIZE in bpf/headers/common.h.
@@ -741,7 +750,29 @@ func parseQUICKeyEvent(data []byte) (*types.QUICKeyEvent, error) {
 }
 
 // readLoop reads SSL events from the ring buffer and forwards them.
+// sslDedupEntry is a fingerprint for recent SSL events, used to suppress
+// duplicate BPF ring buffer deliveries.  NSS's ssl_SecureRecv on ARM64
+// can trigger the entry+return probe pair twice per logical read (~100-200µs
+// apart), producing identical events.  A small circular buffer of recent
+// fingerprints catches these without affecting unrelated events.
+type sslDedupEntry struct {
+	pid     uint32
+	connID  uint64
+	isRead  bool
+	dataLen uint32
+	hash    uint32 // FNV-32a of data
+	tsNS    uint64 // BPF timestamp
+}
+
+const (
+	dedupWindowSize = 16          // ring buffer capacity
+	dedupMaxAgeNS   = 1_000_000  // 1ms — duplicates arrive within ~200µs
+)
+
 func (i *Interceptor) readLoop(ch chan<- *types.SSLEvent) {
+	var ring [dedupWindowSize]sslDedupEntry
+	var ringPos int
+
 	for {
 		record, err := i.reader.Read()
 		if err != nil {
@@ -757,6 +788,44 @@ func (i *Interceptor) readLoop(ch chan<- *types.SSLEvent) {
 			log.Printf("[tls] parse error: %v", err)
 			continue
 		}
+
+		// Compute fingerprint.
+		h := fnv.New32a()
+		h.Write(ev.Data)
+		fp := sslDedupEntry{
+			pid:     ev.PID,
+			connID:  ev.ConnID,
+			isRead:  ev.IsRead,
+			dataLen: uint32(len(ev.Data)),
+			hash:    h.Sum32(),
+			tsNS:    ev.TimestampNS,
+		}
+
+		// Check against recent events.
+		dup := false
+		for j := 0; j < dedupWindowSize; j++ {
+			r := &ring[j]
+			if r.tsNS == 0 {
+				continue
+			}
+			if fp.tsNS < r.tsNS || fp.tsNS-r.tsNS > dedupMaxAgeNS {
+				continue
+			}
+			if r.pid == fp.pid && r.connID == fp.connID &&
+				r.isRead == fp.isRead && r.dataLen == fp.dataLen &&
+				r.hash == fp.hash {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			sslDedupCount.Add(1)
+			continue
+		}
+
+		// Record fingerprint.
+		ring[ringPos] = fp
+		ringPos = (ringPos + 1) % dedupWindowSize
 
 		select {
 		case ch <- ev:

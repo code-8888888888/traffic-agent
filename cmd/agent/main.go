@@ -194,9 +194,10 @@ func main() {
 			for range ticker.C {
 				rx, h2p, h2r, h1, skip := parser.SSLEventStats()
 				sslDrops := tls.SSLDropCountReset()
-				if rx > 0 || sslDrops > 0 {
-					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d chan_len=%d body_hits=%d h2conns=%d",
-						rx, h2p, h2r, h1, skip, sslDrops, len(sslEventCh), parser.SSLBodyHits(), p.H2ConnCount())
+				sslDedups := tls.SSLDedupCountReset()
+				if rx > 0 || sslDrops > 0 || sslDedups > 0 {
+					log.Printf("[stats] SSL events: received=%d h2_preface=%d h2_routed=%d h1=%d skipped=%d drops=%d dedup=%d chan_len=%d body_hits=%d h2conns=%d",
+						rx, h2p, h2r, h1, skip, sslDrops, sslDedups, len(sslEventCh), parser.SSLBodyHits(), p.H2ConnCount())
 				}
 				h2cConns, h2cFrames := parser.H2CStats()
 				if h2cConns > 0 || h2cFrames > 0 {
