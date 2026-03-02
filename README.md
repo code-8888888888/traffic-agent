@@ -17,6 +17,7 @@ A Go application that passively intercepts and inspects **HTTP and HTTPS** netwo
 - [Configuration Reference](#configuration-reference)
 - [Output Format](#output-format)
 - [Event Streaming](#event-streaming)
+- [Reading Captured Events](#reading-captured-events)
 - [Systemd Installation](#systemd-installation)
 - [Required Capabilities](#required-capabilities)
 - [Makefile Targets](#makefile-targets)
@@ -635,6 +636,57 @@ curl -sN http://127.0.0.1:9000/events | jq 'select(.http_method == "POST")'
 ```
 
 Multiple concurrent subscribers are supported; each receives all events independently.
+
+---
+
+## Reading Captured Events
+
+The `scripts/read-events.py` script reconstructs full HTTP responses from the captured `events.json` file. It extracts SSE `content_block_delta` tokens and reassembles them into the complete response text.
+
+### Basic usage
+
+```bash
+# Show the last captured response (default: filters to /v1/messages)
+python3 scripts/read-events.py
+
+# Show all captured responses
+python3 scripts/read-events.py --all
+
+# Use a custom events file
+python3 scripts/read-events.py -f /var/log/traffic-agent/events.json
+```
+
+### Filtering
+
+```bash
+# Filter by URL pattern
+python3 scripts/read-events.py --url /v1/messages
+python3 scripts/read-events.py --url /api/chat
+
+# Show all events without URL filtering
+python3 scripts/read-events.py --no-filter
+```
+
+### Detailed output
+
+```bash
+# Show raw event details (all individual SSE chunks)
+python3 scripts/read-events.py --raw
+```
+
+### Example output
+
+```
+Request: POST /v1/messages?beta=true
+Process: HTTP Client (pid=296857)
+Prompt:  List the 7 wonders of the ancient world
+Events:  82 total, 75 content tokens
+------------------------------------------------------------
+Response:
+1. **Great Pyramid of Giza** — The oldest and only surviving wonder...
+2. **Hanging Gardens of Babylon** — Elaborate tiered gardens...
+...
+```
 
 ---
 

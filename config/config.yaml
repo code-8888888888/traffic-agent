@@ -112,8 +112,12 @@ tls:
   #   nm <binary>         | grep SSL_write   # if full symbol table present
   #   # For fully stripped: use a debug build of the same version.
   #
-  # boringssl_executables:
-  #
+  boringssl_executables:
+    - path: /home/ubuntu/.local/share/claude/versions/2.1.63
+      process_name: claude
+      ssl_write_offset: 0x6094b80
+      ssl_read_offset:  0x6093ec0
+
   #   # Chromium snap (ARM64, stripped — replace offsets with your version's values):
   #   - path: /snap/chromium/current/usr/lib/chromium-browser/chrome
   #     process_name: chrome
