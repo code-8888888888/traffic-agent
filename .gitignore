@@ -1,3 +1,4 @@
 bin/
 *.o
 index.html*
+traffic-agent
