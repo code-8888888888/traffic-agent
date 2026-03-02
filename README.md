@@ -674,6 +674,25 @@ python3 scripts/read-events.py --no-filter
 python3 scripts/read-events.py --raw
 ```
 
+### Browser capture (Firefox)
+
+The script also works with traffic captured from Firefox (e.g., claude.ai). Use a broader URL filter since the browser uses different API paths than the CLI:
+
+```bash
+# Claude.ai browser traffic
+sudo python3 scripts/read-events.py -f events.json --url /api/
+
+# All captured traffic regardless of URL
+sudo python3 scripts/read-events.py -f events.json --no-filter --all
+```
+
+**Requirements for browser capture:**
+
+- **Firefox only** — Chromium's statically-linked BoringSSL is stripped and not configured for interception by default.
+- **QUIC auto-disabled** — The agent writes `user.js` to Firefox profiles on startup to disable QUIC/HTTP3, forcing all HTTPS through HTTP/2 over TLS which the NSS uprobes can capture.
+- **Firefox restart required** — Firefox must be (re)started after the agent starts for the `user.js` QUIC disable to take effect.
+- **`events.json` is root-owned** — Use `sudo` to read it, or adjust file permissions in the output config.
+
 ### Example output
 
 ```
