@@ -643,6 +643,18 @@ Multiple concurrent subscribers are supported; each receives all events independ
 
 The `scripts/read-events.py` script reconstructs full HTTP responses from the captured `events.json` file. It extracts SSE `content_block_delta` tokens and reassembles them into the complete response text.
 
+### CLI capture (Claude Code)
+
+**Requirements for Claude CLI capture:**
+
+- **BoringSSL offsets required** — Claude CLI (Bun runtime) statically links a stripped BoringSSL. The `tls.boringssl_executables` config must have the correct `ssl_write_offset` and `ssl_read_offset` for your installed version. These offsets are version-specific and must be updated when the Claude CLI binary is upgraded.
+- **`events.json` is root-owned** — Use `sudo` to read it, or adjust file permissions in the output config.
+
+```bash
+# Read the last Claude CLI response
+sudo python3 scripts/read-events.py -f events.json
+```
+
 ### Basic usage
 
 ```bash
