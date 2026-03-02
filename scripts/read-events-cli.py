@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Reconstruct captured HTTP responses from traffic-agent events.json.
+"""Reconstruct captured Claude CLI (Claude Code) responses from events.json.
 
-Generic event reader with URL filtering. For source-specific scripts:
-    ./scripts/read-events-cli.py       # Claude CLI (/v1/messages)
-    ./scripts/read-events-browser.py   # Browser / claude.ai (/completion)
+Reads NDJSON events produced by traffic-agent and reconstructs full
+responses by extracting SSE content_block_delta tokens from /v1/messages
+requests (the Anthropic API endpoint used by Claude CLI).
 
 Usage:
-    ./scripts/read-events.py                          # last response
-    ./scripts/read-events.py --all                    # all responses
-    ./scripts/read-events.py --url /v1/messages       # filter by URL
-    ./scripts/read-events.py --raw                    # show all event details
-    ./scripts/read-events.py -f /path/to/events.json  # custom file
+    ./scripts/read-events-cli.py                          # last response
+    ./scripts/read-events-cli.py --all                    # all responses
+    ./scripts/read-events-cli.py --raw                    # show all event details
+    ./scripts/read-events-cli.py -f /path/to/events.json  # custom file
 """
 
 import argparse
@@ -28,7 +27,7 @@ def load_events(path):
     return events
 
 
-def find_request_groups(events, url_filter=None):
+def find_request_groups(events, url_filter="/v1/messages"):
     """Split events into groups, each starting with an egress request."""
     groups = []
     current = []
@@ -101,7 +100,6 @@ def print_raw(group):
         direction = ev.get("direction", "")
         method = ev.get("http_method", "")
         status = ev.get("status_code", 0)
-        url = ev.get("url", "")
         body = ev.get("body_snippet", "")
         snippet = body[:200] if body else ""
         print(f"  [{i+1}] {direction:8s} {method:6s} status={status} bodyLen={len(body)}")
@@ -110,12 +108,12 @@ def print_raw(group):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read traffic-agent captured events")
+    parser = argparse.ArgumentParser(
+        description="Read Claude CLI responses from traffic-agent events"
+    )
     parser.add_argument("-f", "--file", default="events.json", help="Path to events.json")
-    parser.add_argument("--url", default="/v1/messages", help="URL filter (default: /v1/messages)")
     parser.add_argument("--all", action="store_true", help="Show all responses, not just the last")
     parser.add_argument("--raw", action="store_true", help="Show raw event details")
-    parser.add_argument("--no-filter", action="store_true", help="Don't filter by URL")
     args = parser.parse_args()
 
     try:
@@ -124,11 +122,10 @@ def main():
         print(f"Error: {args.file} not found", file=sys.stderr)
         sys.exit(1)
 
-    url_filter = None if args.no_filter else args.url
-    groups = find_request_groups(events, url_filter)
+    groups = find_request_groups(events, "/v1/messages")
 
     if not groups:
-        print("No matching request/response groups found.")
+        print("No Claude CLI (/v1/messages) request/response groups found.")
         sys.exit(0)
 
     targets = groups if args.all else [groups[-1]]
