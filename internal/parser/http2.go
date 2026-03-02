@@ -151,6 +151,13 @@ type h2ConnState struct {
 	// and a fresh one can be created from the next preface.
 	consecutiveErrors int
 
+	// Mid-connection join: when the agent starts after the H2 connection was
+	// already established, the HPACK dynamic table is out of sync.  The first
+	// few HPACK decode errors are expected and should not count toward the
+	// corruption threshold.
+	midConnJoin       bool
+	hpackRecoveryLeft int // suppress consecutiveErrors for first N HPACK errors
+
 	updated time.Time
 }
 
@@ -170,6 +177,23 @@ func newH2ConnState() *h2ConnState {
 		activeStreams: make(map[uint32]*h2StreamInfo),
 		maxFrameSize: 16384,
 		updated:      time.Now(),
+	}
+}
+
+// newH2ConnStateMidJoin creates an h2ConnState for mid-connection joins where
+// the HPACK dynamic table is out of sync.  The first hpackRecoveryLeft HPACK
+// errors are forgiven (don't count toward consecutiveErrors) to prevent the
+// state from being prematurely deleted.
+func newH2ConnStateMidJoin() *h2ConnState {
+	h2MidConnJoins.Add(1)
+	return &h2ConnState{
+		writeDecoder:      newHPACKDecoder(),
+		readDecoder:       newHPACKDecoder(),
+		activeStreams:     make(map[uint32]*h2StreamInfo),
+		maxFrameSize:      16384,
+		midConnJoin:       true,
+		hpackRecoveryLeft: 10,
+		updated:           time.Now(),
 	}
 }
 
@@ -251,9 +275,11 @@ var (
 
 // TLS H2 diagnostic counters.
 var (
-	h2TLSDataFrames   atomic.Int64
-	h2TLSHPACKErrors  atomic.Int64
+	h2TLSDataFrames    atomic.Int64
+	h2TLSHPACKErrors   atomic.Int64
 	h2TLSEventsEmitted atomic.Int64
+	h2MidConnJoins     atomic.Int64
+	h2StatesExpired    atomic.Int64
 )
 
 // debugH2 enables verbose H2 frame-level logging.
@@ -270,6 +296,11 @@ func H2CStats() (connections, frames int64) {
 // H2TLSStats returns diagnostic counters for TLS H2 processing.
 func H2TLSStats() (dataFrames, hpackErrors, eventsEmitted int64) {
 	return h2TLSDataFrames.Load(), h2TLSHPACKErrors.Load(), h2TLSEventsEmitted.Load()
+}
+
+// H2StateStats returns diagnostic counters for H2 connection state lifecycle.
+func H2StateStats() (midConnJoins, statesExpired int64) {
+	return h2MidConnJoins.Load(), h2StatesExpired.Load()
 }
 
 // handleH2Event appends data to the connection's direction buffer and
@@ -568,7 +599,11 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 		}
 
 		if len(fields) == 0 {
-			s.consecutiveErrors++
+			if s.hpackRecoveryLeft > 0 {
+				s.hpackRecoveryLeft--
+			} else {
+				s.consecutiveErrors++
+			}
 			return
 		}
 	}

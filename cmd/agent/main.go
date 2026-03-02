@@ -136,7 +136,7 @@ func main() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			p.FlushExpired(60 * time.Second)
+			p.FlushExpired(60*time.Second, 30*time.Minute)
 			h3Parser.FlushExpired(60 * time.Second)
 			quicProc.FlushExpired(60 * time.Second)
 			capture.PurgeProcCache()
@@ -206,6 +206,11 @@ func main() {
 				if h2df > 0 || h2he > 0 {
 					log.Printf("[stats] H2/TLS: data_frames=%d hpack_errors=%d events_emitted=%d",
 						h2df, h2he, h2ee)
+				}
+				mcj, hexp := parser.H2StateStats()
+				if mcj > 0 || hexp > 0 {
+					log.Printf("[stats] H2 state: mid_conn_joins=%d states_expired=%d active=%d",
+						mcj, hexp, p.H2ConnCount())
 				}
 			}
 		}()

@@ -233,7 +233,7 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 	// it requires specific frame types with valid semantic constraints, so
 	// the false-positive rate from NSPR IPC noise is negligible.
 	if h2State == nil && looksLikeH2MidConnection(ev.Data) {
-		h2State = newH2ConnState()
+		h2State = newH2ConnStateMidJoin()
 		p.mu.Lock()
 		p.h2Conns[h2Key] = h2State
 		p.mu.Unlock()
@@ -354,25 +354,36 @@ func (p *Parser) tryParseSSLData(data []byte, ev *types.SSLEvent) *types.Traffic
 	}
 }
 
-// FlushExpired removes stale flow buffers that have been idle longer than
-// olderThan. Call this periodically to prevent unbounded memory growth.
-func (p *Parser) FlushExpired(olderThan time.Duration) {
-	cutoff := time.Now().Add(-olderThan)
+// FlushExpired removes stale flow buffers and H2 connection states that have
+// been idle longer than their respective timeouts.
+//   - flowTimeout applies to HTTP/1.1 accumulation buffers (bufs, sslBufs)
+//   - h2Timeout applies to persistent HTTP/2 connection states (h2Conns)
+//
+// H2 connections are long-lived (browsers keep them open for minutes/hours),
+// so h2Timeout should be much longer than flowTimeout to avoid losing HPACK
+// state for idle-but-alive connections.
+func (p *Parser) FlushExpired(flowTimeout, h2Timeout time.Duration) {
+	now := time.Now()
+	flowCutoff := now.Add(-flowTimeout)
+	h2Cutoff := now.Add(-h2Timeout)
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for key, fb := range p.bufs {
-		if fb.updated.Before(cutoff) {
+		if fb.updated.Before(flowCutoff) {
 			delete(p.bufs, key)
 		}
 	}
 	for key, fb := range p.sslBufs {
-		if fb.updated.Before(cutoff) {
+		if fb.updated.Before(flowCutoff) {
 			delete(p.sslBufs, key)
 		}
 	}
+	h2Expired := 0
 	for key, state := range p.h2Conns {
-		if state.updated.Before(cutoff) {
+		if state.updated.Before(h2Cutoff) {
 			delete(p.h2Conns, key)
+			h2Expired++
 			// If this is an h2c connection (has network fields), clean up h2cFlows.
 			if key.SrcIP != "" {
 				fwd := flowKey{srcIP: key.SrcIP, dstIP: key.DstIP, srcPort: key.SrcPort, dstPort: key.DstPort}
@@ -381,6 +392,10 @@ func (p *Parser) FlushExpired(olderThan time.Duration) {
 				delete(p.h2cFlows, rev)
 			}
 		}
+	}
+	if h2Expired > 0 {
+		h2StatesExpired.Add(int64(h2Expired))
+		log.Printf("[parser] FlushExpired: removed %d H2 connection state(s), %d remaining", h2Expired, len(p.h2Conns))
 	}
 }
 
@@ -566,7 +581,7 @@ func (p *Parser) initH2CMidConnection(key flowKey, data []byte, ev *types.RawPac
 	}
 	p.h2cFlows[reverseKey] = true
 
-	state := newH2ConnState()
+	state := newH2ConnStateMidJoin()
 	p.h2Conns[connKey] = state
 	delete(p.bufs, key)
 	p.mu.Unlock()
