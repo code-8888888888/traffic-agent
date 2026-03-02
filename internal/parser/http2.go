@@ -145,6 +145,12 @@ type h2ConnState struct {
 	// SETTINGS_MAX_FRAME_SIZE (default 16384, max 16777215).
 	maxFrameSize int
 
+	// knownHost tracks the last successfully decoded :authority header for
+	// this connection.  When HPACK dynamic table is desynced (mid-connection
+	// join), subsequent HEADERS frames may lose :authority.  This provides
+	// a connection-level fallback.
+	knownHost string
+
 	// Corruption tracking.  NSPR's PR_Write fires for ALL I/O, not just TLS.
 	// Non-HTTP/2 data that sneaks through can corrupt frame parsing.  If too
 	// many consecutive frames fail validation, the connection state is deleted
@@ -280,6 +286,7 @@ var (
 	h2TLSEventsEmitted atomic.Int64
 	h2MidConnJoins     atomic.Int64
 	h2StatesExpired    atomic.Int64
+	h2LenientDecodes   atomic.Int64
 )
 
 // debugH2 enables verbose H2 frame-level logging.
@@ -299,8 +306,8 @@ func H2TLSStats() (dataFrames, hpackErrors, eventsEmitted int64) {
 }
 
 // H2StateStats returns diagnostic counters for H2 connection state lifecycle.
-func H2StateStats() (midConnJoins, statesExpired int64) {
-	return h2MidConnJoins.Load(), h2StatesExpired.Load()
+func H2StateStats() (midConnJoins, statesExpired, lenientDecodes int64) {
+	return h2MidConnJoins.Load(), h2StatesExpired.Load(), h2LenientDecodes.Load()
 }
 
 // handleH2Event appends data to the connection's direction buffer and
@@ -335,6 +342,7 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 			state.pendingReadEndStream = false
 			state.consecutiveErrors = 0
 			state.maxFrameSize = 16384
+			state.knownHost = ""
 		}
 		if len(d) == 0 {
 			p.mu.Unlock()
@@ -525,7 +533,22 @@ func (s *h2ConnState) processHeadersFrame(payload []byte, flags byte, streamID u
 
 func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, streamID uint32, isRead bool, meta *h2EventMeta, emit func(*types.TrafficEvent)) {
 	if isRead {
-		if s.pendingReadBlock == nil || s.pendingReadStream != streamID {
+		if s.pendingReadBlock == nil {
+			if s.midConnJoin {
+				// Orphaned CONTINUATION — HEADERS was before agent start.
+				block := make([]byte, len(payload))
+				copy(block, payload)
+				if flags&h2FlagEndHeaders != 0 {
+					s.emitFromBlock(block, streamID, isRead, meta, emit)
+				} else {
+					s.pendingReadBlock = block
+					s.pendingReadStream = streamID
+					s.pendingReadEndStream = false
+				}
+			}
+			return
+		}
+		if s.pendingReadStream != streamID {
 			return
 		}
 		s.pendingReadBlock = append(s.pendingReadBlock, payload...)
@@ -539,7 +562,22 @@ func (s *h2ConnState) processContinuationFrame(payload []byte, flags byte, strea
 			}
 		}
 	} else {
-		if s.pendingWriteBlock == nil || s.pendingWriteStream != streamID {
+		if s.pendingWriteBlock == nil {
+			if s.midConnJoin {
+				// Orphaned CONTINUATION — HEADERS was before agent start.
+				block := make([]byte, len(payload))
+				copy(block, payload)
+				if flags&h2FlagEndHeaders != 0 {
+					s.emitFromBlock(block, streamID, isRead, meta, emit)
+				} else {
+					s.pendingWriteBlock = block
+					s.pendingWriteStream = streamID
+					s.pendingWriteEndStream = false
+				}
+			}
+			return
+		}
+		if s.pendingWriteStream != streamID {
 			return
 		}
 		s.pendingWriteBlock = append(s.pendingWriteBlock, payload...)
@@ -598,6 +636,36 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 			retryDec.Write(block) // ignore error — we just want static-table entries
 		}
 
+		// Strategy 3: lenient HPACK scanner — skips dynamic refs, recovers
+		// all static-table and literal header fields.  This recovers :path,
+		// :authority, content-type, etc. that appear AFTER the first dynamic
+		// ref which causes Strategy 1+2 to stop.
+		{
+			hasCritical := false
+			for _, f := range fields {
+				if (!isRead && f.Name == ":path") || (isRead && f.Name == ":status") {
+					hasCritical = true
+					break
+				}
+			}
+			if !hasCritical {
+				lenientFields := lenientDecodeHPACK(block)
+				if len(lenientFields) > 0 {
+					h2LenientDecodes.Add(1)
+					existing := make(map[string]bool, len(fields))
+					for _, f := range fields {
+						existing[f.Name] = true
+					}
+					for _, f := range lenientFields {
+						if !existing[f.Name] {
+							fields = append(fields, f)
+							existing[f.Name] = true
+						}
+					}
+				}
+			}
+		}
+
 		if len(fields) == 0 {
 			if s.hpackRecoveryLeft > 0 {
 				s.hpackRecoveryLeft--
@@ -640,6 +708,13 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 	}
 	if method == "" {
 		return // trailers — skip
+	}
+	// Track and fall back to the last known host for this connection.
+	// Mid-connection join may lose :authority due to dynamic table desync.
+	if host != "" {
+		s.knownHost = host
+	} else if s.knownHost != "" {
+		host = s.knownHost
 	}
 	if host != "" {
 		headers["Host"] = host

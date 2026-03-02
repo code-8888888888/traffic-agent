@@ -212,10 +212,10 @@ func main() {
 				if sseStreams > 0 || sseChunks > 0 {
 					log.Printf("[stats] SSE: streams=%d chunks=%d", sseStreams, sseChunks)
 				}
-				mcj, hexp := parser.H2StateStats()
-				if mcj > 0 || hexp > 0 {
-					log.Printf("[stats] H2 state: mid_conn_joins=%d states_expired=%d active=%d",
-						mcj, hexp, p.H2ConnCount())
+				mcj, hexp, ldc := parser.H2StateStats()
+				if mcj > 0 || hexp > 0 || ldc > 0 {
+					log.Printf("[stats] H2 state: mid_conn_joins=%d states_expired=%d active=%d lenient_decodes=%d",
+						mcj, hexp, p.H2ConnCount(), ldc)
 				}
 			}
 		}()
