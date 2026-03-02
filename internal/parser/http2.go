@@ -107,6 +107,12 @@ type h2StreamInfo struct {
 	statusCode      int    // from response HEADERS
 	contentEncoding string // for decompression (gzip, br, zstd, deflate)
 
+	// detectedEncoding is set by speculative decompression when
+	// contentEncoding is empty (HPACK dynamic table lost content-encoding
+	// during mid-connection join).  Once set, subsequent DATA frames on the
+	// same stream skip re-probing.
+	detectedEncoding string
+
 	// compressedBuf accumulates compressed DATA frame payloads for
 	// streaming decompression.  Capped at 64 KB to prevent unbounded growth.
 	compressedBuf []byte
@@ -163,6 +169,17 @@ type h2ConnState struct {
 	// corruption threshold.
 	midConnJoin       bool
 	hpackRecoveryLeft int // suppress consecutiveErrors for first N HPACK errors
+
+	// confirmedH2 is set to true once at least one valid H2 frame has been
+	// successfully consumed on this connection.  Once confirmed, write-side
+	// validation is relaxed (no longer requires isValidH2FrameStart) to
+	// avoid silently dropping legitimate H2 frames that happen to look
+	// ambiguous at the start byte level (e.g., zero-length-prefix DATA).
+	confirmedH2 bool
+
+	// Per-connection write event diagnostic counters.
+	writeEvents  int
+	writeRejects int
 
 	updated time.Time
 }
@@ -287,6 +304,8 @@ var (
 	h2MidConnJoins     atomic.Int64
 	h2StatesExpired    atomic.Int64
 	h2LenientDecodes   atomic.Int64
+	h2WriteRejections  atomic.Int64
+	h2SpecDecomps      atomic.Int64
 )
 
 // debugH2 enables verbose H2 frame-level logging.
@@ -308,6 +327,16 @@ func H2TLSStats() (dataFrames, hpackErrors, eventsEmitted int64) {
 // H2StateStats returns diagnostic counters for H2 connection state lifecycle.
 func H2StateStats() (midConnJoins, statesExpired, lenientDecodes int64) {
 	return h2MidConnJoins.Load(), h2StatesExpired.Load(), h2LenientDecodes.Load()
+}
+
+// H2WriteStats returns diagnostic counters for H2 write-side processing.
+func H2WriteStats() int64 {
+	return h2WriteRejections.Load()
+}
+
+// H2SpecDecompStats returns the count of successful speculative decompressions.
+func H2SpecDecompStats() int64 {
+	return h2SpecDecomps.Load()
 }
 
 // handleH2Event appends data to the connection's direction buffer and
@@ -352,13 +381,34 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 		// When the write buffer is empty we are NOT in the middle of a
 		// partial frame.  Validate that new data looks like HTTP/2 frames
 		// to filter out non-TLS PR_Write noise (IPC, files, etc.).
+		state.writeEvents++
 		if len(state.writeBuf) == 0 && !isValidH2FrameStart(d) {
-			if debugH2.Load() && len(d) >= 4 {
-				log.Printf("[h2-debug] REJECTED write data pid=%d len=%d firstbytes=%x",
-					meta.PID, len(d), d[:min(8, len(d))])
+			if state.confirmedH2 {
+				// Confirmed H2 connection — accumulate anyway UNLESS it
+				// looks like a TLS record (ciphertext from fd reuse).
+				if isTLSRecord(d) {
+					h2WriteRejections.Add(1)
+					state.writeRejects++
+					p.mu.Unlock()
+					return
+				}
+				// Fall through to accumulate — parseH2Frames + consecutiveErrors
+				// will detect if this is actually garbage.
+			} else {
+				h2WriteRejections.Add(1)
+				state.writeRejects++
+				// Log first 10 rejections per connection for diagnostics.
+				if state.writeRejects <= 10 {
+					hexBytes := d[:min(16, len(d))]
+					log.Printf("[h2-write] REJECTED pid=%d conn=0x%x len=%d first16=%x (reject #%d, total_events=%d)",
+						meta.PID, connKey.ConnID, len(d), hexBytes, state.writeRejects, state.writeEvents)
+				} else if state.writeRejects%10 == 0 {
+					log.Printf("[h2-write] reject summary pid=%d conn=0x%x rejects=%d/%d",
+						meta.PID, connKey.ConnID, state.writeRejects, state.writeEvents)
+				}
+				p.mu.Unlock()
+				return
 			}
-			p.mu.Unlock()
-			return
 		}
 
 		if len(state.writeBuf)+len(d) <= maxFlowBufSize {
@@ -425,6 +475,18 @@ func isValidH2FrameStart(data []byte) bool {
 	return true
 }
 
+// isTLSRecord checks whether data begins with a TLS record header.
+// Used to reject ciphertext that leaks in via fd address reuse on confirmed
+// H2 connections (where normal isValidH2FrameStart validation is relaxed).
+func isTLSRecord(data []byte) bool {
+	if len(data) < 5 {
+		return false
+	}
+	// TLS record: content type (0x14-0x17), version (0x0301-0x0304), length
+	return data[0] >= 0x14 && data[0] <= 0x17 &&
+		data[1] == 0x03 && data[2] >= 0x01 && data[2] <= 0x04
+}
+
 // parseH2Frames consumes as many complete HTTP/2 frames as possible from data
 // and calls emit for any request or response events decoded from HEADERS frames.
 // Returns the number of bytes consumed.
@@ -471,8 +533,9 @@ func (s *h2ConnState) parseH2Frames(data []byte, isRead bool, meta *h2EventMeta,
 			h2cFramesParsed.Add(1)
 		}
 
-		// Valid frame consumed — reset error counter.
+		// Valid frame consumed — reset error counter and mark connection confirmed.
 		s.consecutiveErrors = 0
+		s.confirmedH2 = true
 
 		consumed += total
 		data = data[total:]
@@ -808,6 +871,44 @@ func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, streamID ui
 	})
 }
 
+// looksCompressed reports whether data appears to be compressed (binary) rather
+// than plaintext.  Returns true if >30% of the first 64 bytes are non-printable
+// (outside 0x20-0x7e, excluding \t \n \r).  This avoids triggering speculative
+// decompression on plaintext JSON or SSE data.
+func looksCompressed(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	n := len(data)
+	if n > 64 {
+		n = 64
+	}
+	nonPrintable := 0
+	for _, b := range data[:n] {
+		if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+			nonPrintable++
+		} else if b > 0x7e {
+			nonPrintable++
+		}
+	}
+	return nonPrintable*100/n > 30
+}
+
+// tryDecompress attempts to decompress data using each supported codec in order
+// of frequency on claude.ai (br, gzip, zstd, deflate).  Returns the codec name
+// on the first successful decompression, or "" if all fail.
+func tryDecompress(data []byte) string {
+	for _, enc := range []string{"br", "gzip", "zstd", "deflate"} {
+		result := decompressBodyAt(data, enc, 0)
+		// decompressBodyAt returns "<codec-error>" on failure, "" on empty.
+		// A successful decode produces non-empty output without the error prefix.
+		if result != "" && result[0] != '<' {
+			return enc
+		}
+	}
+	return ""
+}
+
 // processDataFrame extracts a body snippet from an HTTP/2 DATA frame and
 // emits a TrafficEvent correlated with the stream's HEADERS metadata.
 // For write (egress) frames, it looks up the request info from activeStreams.
@@ -900,6 +1001,9 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 		encoding := ""
 		if info != nil {
 			encoding = info.contentEncoding
+			if encoding == "" {
+				encoding = info.detectedEncoding // cached from prior speculative hit
+			}
 		}
 
 		snippetStr := ""
@@ -914,6 +1018,25 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 			snippetStr = decompressBodyAt(info.compressedBuf, encoding, info.decompOffset)
 			if snippetStr != "" && !strings.HasPrefix(snippetStr, "<") {
 				info.decompOffset += len(snippetStr)
+			}
+		} else if info != nil && looksCompressed(body) {
+			// Speculative decompression: HPACK lost content-encoding
+			// (dynamic table ref during mid-connection join).  Try each
+			// codec and cache the winner for subsequent DATA frames.
+			const maxCompBuf = 64 * 1024
+			if len(info.compressedBuf)+len(body) <= maxCompBuf {
+				info.compressedBuf = append(info.compressedBuf, body...)
+			}
+			detected := tryDecompress(info.compressedBuf)
+			if detected != "" {
+				info.detectedEncoding = detected
+				h2SpecDecomps.Add(1)
+				snippetStr = decompressBodyAt(info.compressedBuf, detected, info.decompOffset)
+				if snippetStr != "" && !strings.HasPrefix(snippetStr, "<") {
+					info.decompOffset += len(snippetStr)
+				}
+			} else {
+				snippetStr = string(snippet)
 			}
 		} else {
 			snippetStr = string(snippet)

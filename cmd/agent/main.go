@@ -204,9 +204,11 @@ func main() {
 					log.Printf("[stats] h2c: connections=%d frames=%d", h2cConns, h2cFrames)
 				}
 				h2df, h2he, h2ee := parser.H2TLSStats()
-				if h2df > 0 || h2he > 0 {
-					log.Printf("[stats] H2/TLS: data_frames=%d hpack_errors=%d events_emitted=%d",
-						h2df, h2he, h2ee)
+				h2wr := parser.H2WriteStats()
+				h2sd := parser.H2SpecDecompStats()
+				if h2df > 0 || h2he > 0 || h2wr > 0 || h2sd > 0 {
+					log.Printf("[stats] H2/TLS: data_frames=%d hpack_errors=%d events_emitted=%d h2_write_rejects=%d h2_spec_decomp=%d",
+						h2df, h2he, h2ee, h2wr, h2sd)
 				}
 				sseStreams, sseChunks := parser.SSEStreamStats()
 				if sseStreams > 0 || sseChunks > 0 {
