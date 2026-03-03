@@ -180,6 +180,7 @@ type h2ConnState struct {
 	// Per-connection write event diagnostic counters.
 	writeEvents  int
 	writeRejects int
+	readEvents   int
 
 	updated time.Time
 }
@@ -421,6 +422,7 @@ func (p *Parser) handleH2Event(state *h2ConnState, data []byte, isRead bool, met
 		}
 	} else {
 		// Incoming: server -> browser.
+		state.readEvents++
 		if len(state.readBuf) == 0 && !isValidH2FrameStart(data) {
 			if debugH2.Load() && len(data) >= 4 {
 				log.Printf("[h2-debug] REJECTED read data pid=%d len=%d firstbytes=%x",
