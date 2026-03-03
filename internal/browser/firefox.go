@@ -28,11 +28,21 @@ import (
 )
 
 const (
-	marker       = "// [traffic-agent] managed — do not edit this line"
-	quicPref     = `user_pref("network.http.http3.enabled", false);`
-	blockStart   = marker + " BEGIN"
-	blockEnd     = marker + " END"
-	blockContent = blockStart + "\n" + quicPref + "\n" + blockEnd
+	marker     = "// [traffic-agent] managed — do not edit this line"
+	blockStart = marker + " BEGIN"
+	blockEnd   = marker + " END"
+
+	// Fully disable HTTP/3 (QUIC) in Firefox.
+	//
+	// network.http.http3.enabled=false is the primary switch, but Firefox 148+
+	// still upgrades to H3 when the server advertises it via Alt-Svc headers
+	// (e.g., `h3=":443"; ma=86400`). To prevent this, we also disable Alt-Svc
+	// entirely and clear the Alt-Svc mapping cache.
+	blockContent = blockStart + "\n" +
+		`user_pref("network.http.http3.enabled", false);` + "\n" +
+		`user_pref("network.http.altsvc.enabled", false);` + "\n" +
+		`user_pref("network.http.altsvc.oe", false);` + "\n" +
+		blockEnd
 )
 
 // ConfigureFirefox discovers all Firefox profiles for the real (non-root)
@@ -229,24 +239,51 @@ func parseProfilesINI(iniPath, rootDir string) []string {
 	return profiles
 }
 
-// writeQUICDisable appends (or confirms) the QUIC-disable block in user.js.
+// writeQUICDisable writes the QUIC-disable block in user.js.
+// If a previous version of the block exists, it is replaced with the current content.
 func writeQUICDisable(profileDir string, uid, gid int) error {
 	userJsPath := filepath.Join(profileDir, "user.js")
 
-	// If already configured, skip.
-	if data, err := os.ReadFile(userJsPath); err == nil {
-		if strings.Contains(string(data), blockStart) {
-			return nil
+	data, readErr := os.ReadFile(userJsPath)
+	content := ""
+	if readErr == nil {
+		content = string(data)
+	}
+
+	// If the current block is already present verbatim, skip.
+	if strings.Contains(content, blockContent) {
+		return nil
+	}
+
+	// If an older version of the block exists, remove it first.
+	if strings.Contains(content, blockStart) {
+		lines := strings.Split(content, "\n")
+		var filtered []string
+		inBlock := false
+		for _, line := range lines {
+			if line == blockStart {
+				inBlock = true
+				continue
+			}
+			if line == blockEnd {
+				inBlock = false
+				continue
+			}
+			if !inBlock {
+				filtered = append(filtered, line)
+			}
 		}
+		content = strings.Join(filtered, "\n")
 	}
 
-	f, err := os.OpenFile(userJsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("open user.js: %w", err)
+	// Append the current block.
+	content = strings.TrimRight(content, "\n")
+	if content != "" {
+		content += "\n"
 	}
-	defer f.Close()
+	content += "\n" + blockContent + "\n"
 
-	if _, err := fmt.Fprintf(f, "\n%s\n", blockContent); err != nil {
+	if err := os.WriteFile(userJsPath, []byte(content), 0644); err != nil {
 		return fmt.Errorf("write user.js: %w", err)
 	}
 

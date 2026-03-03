@@ -208,11 +208,13 @@ func (i *Interceptor) Stop() error {
 	return nil
 }
 
-// periodicScan re-scans /proc every 10 s and attaches uprobes to any SSL
+// periodicScan re-scans /proc every 2 s and attaches uprobes to any SSL
 // library paths not yet covered.  This allows the agent to intercept TLS from
 // browsers (Firefox, etc.) that were started after the agent itself.
+// The short interval (2s) is critical: Firefox establishes TLS connections
+// within seconds of launch, and probes must be attached before data flows.
 func (i *Interceptor) periodicScan() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
