@@ -672,6 +672,37 @@ func (s *h2ConnState) emitFromBlock(block []byte, streamID uint32, isRead bool, 
 	}
 	dec.SetEmitEnabled(false)
 
+	// Check for silent HPACK desync: decode succeeded but critical
+	// pseudo-header is missing.  This happens when the dynamic table
+	// has a stale entry that maps to a different field name than expected,
+	// or when the request HEADERS was dropped entirely and we only see
+	// response HEADERS with desynced dynamic refs.
+	if err == nil {
+		hasCritical := false
+		for _, f := range fields {
+			if (!isRead && f.Name == ":method") || (isRead && f.Name == ":status") {
+				hasCritical = true
+				break
+			}
+		}
+		if !hasCritical && len(block) > 0 {
+			lenientFields := lenientDecodeHPACK(block)
+			if len(lenientFields) > 0 {
+				h2LenientDecodes.Add(1)
+				existing := make(map[string]bool, len(fields))
+				for _, f := range fields {
+					existing[f.Name] = true
+				}
+				for _, f := range lenientFields {
+					if !existing[f.Name] {
+						fields = append(fields, f)
+						existing[f.Name] = true
+					}
+				}
+			}
+		}
+	}
+
 	if err != nil {
 		h2TLSHPACKErrors.Add(1)
 		if h2TLSHPACKErrors.Load()%20 == 1 || debugH2.Load() {
@@ -771,8 +802,11 @@ func (s *h2ConnState) buildRequestEvent(fields []hpack.HeaderField, streamID uin
 		log.Printf("[h2-debug] request stream=%d method=%q path=%q host=%q nheaders=%d pid=%d",
 			streamID, method, path, host, len(fields), meta.PID)
 	}
-	if method == "" {
+	if method == "" && path == "" {
 		return // trailers — skip
+	}
+	if method == "" {
+		method = "UNKNOWN" // HPACK desync lost :method (static index 2/3)
 	}
 	// Track and fall back to the last known host for this connection.
 	// Mid-connection join may lose :authority due to dynamic table desync.
@@ -854,6 +888,7 @@ func (s *h2ConnState) buildResponseEvent(fields []hpack.HeaderField, streamID ui
 		s.activeStreams[streamID] = &h2StreamInfo{
 			statusCode:      statusCode,
 			contentEncoding: contentEncoding,
+			host:            s.knownHost, // fallback from last known :authority
 		}
 	}
 
@@ -1061,6 +1096,9 @@ func (s *h2ConnState) processDataFrame(payload []byte, flags byte, streamID uint
 			te.StatusCode = info.statusCode
 			te.URL = info.path
 			te.HTTPMethod = info.method
+			if info.host != "" {
+				te.RequestHeaders = map[string]string{"Host": info.host}
+			}
 		}
 		emit(te)
 	}

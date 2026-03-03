@@ -12,6 +12,7 @@ import (
 	"flag"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -150,9 +151,22 @@ func main() {
 			if err != nil {
 				log.Printf("[main] Firefox auto-config: %v", err)
 			} else if n > 0 {
-				log.Printf("[main] Firefox: QUIC disabled in %d profile(s) — HTTP/2 over TLS will be used", n)
-				defer browser.RestoreFirefox()
+				log.Printf("[main] Firefox: QUIC permanently disabled in %d profile(s) — HTTP/2 over TLS will be used", n)
 			}
+		}
+
+		// Block outbound QUIC (UDP port 443) at the firewall level.
+		// Firefox may ignore network.http.http3.enabled=false due to
+		// Nimbus experiments, so we enforce the block via iptables.
+		if err := exec.Command("iptables", "-C", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "DROP").Run(); err != nil {
+			// Rule doesn't exist yet — add it.
+			if err := exec.Command("iptables", "-A", "OUTPUT", "-p", "udp", "--dport", "443", "-j", "DROP").Run(); err != nil {
+				log.Printf("[main] iptables QUIC block: %v", err)
+			} else {
+				log.Println("[main] iptables: blocked outbound UDP:443 (QUIC) — forces HTTP/2 fallback")
+			}
+		} else {
+			log.Println("[main] iptables: outbound UDP:443 already blocked")
 		}
 	}
 

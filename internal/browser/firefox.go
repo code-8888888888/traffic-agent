@@ -39,7 +39,12 @@ const (
 	// (e.g., `h3=":443"; ma=86400`). To prevent this, we also disable Alt-Svc
 	// entirely and clear the Alt-Svc mapping cache.
 	blockContent = blockStart + "\n" +
+		"// Disable HTTP/3 (QUIC) completely for TLS interception\n" +
 		`user_pref("network.http.http3.enabled", false);` + "\n" +
+		`user_pref("network.http.http3.enable_0rtt", false);` + "\n" +
+		`user_pref("network.http.http3.enable_kyber", false);` + "\n" +
+		`user_pref("network.http.http3.default-ttl", 0);` + "\n" +
+		"// Disable Alt-Svc (prevents HTTP/3 upgrade discovery)\n" +
 		`user_pref("network.http.altsvc.enabled", false);` + "\n" +
 		`user_pref("network.http.altsvc.oe", false);` + "\n" +
 		blockEnd

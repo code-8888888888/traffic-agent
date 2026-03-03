@@ -12,7 +12,20 @@
       "Bash(head:*)",
       "Bash(ip link show)",
       "Bash(ip:*)",
-      "Bash(sudo strings:*)"
+      "Bash(sudo strings:*)",
+      "Bash(ss:*)",
+      "Bash(pgrep firefox:*)",
+      "Bash(sudo dmesg:*)",
+      "Bash(sudo timeout:*)",
+      "Bash(sudo cat:*)",
+      "Bash(export:*)",
+      "Bash(python3:*)",
+      "Bash(host:*)",
+      "WebSearch",
+      "WebFetch(domain:datatracker.ietf.org)",
+      "WebFetch(domain:platform.anthropic.com)",
+      "Bash(pgrep:*)",
+      "Bash(git status:*)"
     ]
   }
 }

@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Reconstruct captured browser (claude.ai) responses from events.json.
+"""Read captured browser (claude.ai) request and response from traffic-agent output.
 
-Reads NDJSON events produced by traffic-agent and reconstructs full
-responses from the browser's SSE completion stream. The browser uses
-HTTP/2 over TLS via /api/organizations/.../completion. Due to H2
-mid-connection joins, response SSE chunks may arrive without a URL,
-so this script also collects URL-less ingress events containing SSE data.
+Reconstructs full conversation turns from the NDJSON event stream:
+  - REQUEST:  POST /completion egress event with prompt text
+  - RESPONSE: Ingress SSE content_block_delta events (may have empty URL due
+              to H2 mid-connection join — grouped by proximity to the request)
 
-Handles duplicate events (NSS read+return probes capture the same data
-twice) by deduplicating consecutive identical body_snippet values.
+Handles NSS read+return probe deduplication (sliding window).
 
 Usage:
-    ./scripts/read-events-browser.py                          # last response
-    ./scripts/read-events-browser.py --all                    # all responses
-    ./scripts/read-events-browser.py --raw                    # show all event details
-    ./scripts/read-events-browser.py -f /path/to/events.json  # custom file
+    ./scripts/read-events-browser.py                          # last turn
+    ./scripts/read-events-browser.py --all                    # all turns
+    ./scripts/read-events-browser.py --raw                    # show raw events
+    ./scripts/read-events-browser.py --request                # show request body
+    ./scripts/read-events-browser.py --headers                # show request headers
+    ./scripts/read-events-browser.py -f /path/to/stdout.jsonl # custom file
 """
 
 import argparse
@@ -28,20 +28,21 @@ def load_events(path):
         for line in f:
             line = line.strip()
             if line:
-                events.append(json.loads(line))
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
     return events
 
 
 def find_completion_groups(events):
     """Find browser completion request/response groups.
 
-    Groups are formed around POST /completion egress events. The SSE
-    response chunks may arrive as:
-      1. Ingress events with the /completion URL (ideal case)
-      2. Ingress events with no URL but containing SSE data (H2 mid-join)
-
-    For case 2, we collect URL-less SSE ingress events that appear
-    between this completion POST and the next egress request.
+    Groups are formed around POST /completion egress events. H2 splits the
+    request into two egress events (headers-only + body), so we merge
+    consecutive egress events for the same URL. SSE response chunks arrive
+    as ingress events — they may have the /completion URL or an empty URL
+    (H2 mid-connection join).
     """
     groups = []
     current_req = None
@@ -51,9 +52,21 @@ def find_completion_groups(events):
         url = ev.get("url", "")
         direction = ev.get("direction", "")
         body = ev.get("body_snippet", "")
+        method = ev.get("http_method", "")
 
-        # New completion POST request starts a group.
-        if direction == "egress" and "completion" in url and ev.get("http_method") == "POST":
+        # Completion POST request (may arrive as 2 events: headers + body).
+        if direction == "egress" and "completion" in url and method == "POST":
+            req_body = ev.get("request_body", "") or body
+            has_body = bool(req_body and "prompt" in req_body)
+
+            if current_req is not None and not current_events and has_body:
+                # Body event right after header event — merge into current.
+                current_req["_merged_body"] = (
+                    ev.get("request_body", "") or ev.get("body_snippet", "")
+                )
+                continue
+
+            # New request group.
             if current_req is not None:
                 groups.append((current_req, current_events))
             current_req = ev
@@ -68,7 +81,6 @@ def find_completion_groups(events):
                             "content_block_delta", "content_block_stop",
                             "message_delta", "message_stop")
             )
-            # Accept events with matching URL or no URL (H2 mid-join).
             if is_sse and (not url or "completion" in url):
                 current_events.append(ev)
 
@@ -79,13 +91,7 @@ def find_completion_groups(events):
 
 
 def deduplicate(events):
-    """Remove duplicate events (same body_snippet within a sliding window).
-
-    NSS read+return probes both fire for the same SSL_read, producing
-    two copies of every SSE chunk. The duplicates are interleaved with
-    other event types, so simple consecutive dedup is insufficient.
-    We use a sliding window of recent body_snippets to catch them.
-    """
+    """Remove duplicate events (NSS read+return probes fire twice)."""
     deduped = []
     recent = set()
     window = []
@@ -116,30 +122,43 @@ def reconstruct_response(events):
             if part.startswith("data: "):
                 try:
                     data = json.loads(part[6:])
-                    text += data["delta"]["text"]
+                    delta = data.get("delta", {})
+                    text += delta.get("text", "")
                 except (json.JSONDecodeError, KeyError):
                     pass
     return text
 
 
-def get_request_info(req_event):
-    """Extract request metadata from the egress event."""
-    method = req_event.get("http_method", "?")
-    url = req_event.get("url", "?")
-    pid = req_event.get("pid", 0)
-    proc = req_event.get("process_name", "")
-    body = req_event.get("body_snippet", "") or req_event.get("request_body", "")
+def extract_prompt(req_event):
+    """Extract the user's prompt from the request body."""
+    body = (
+        req_event.get("_merged_body", "")
+        or req_event.get("request_body", "")
+        or req_event.get("body_snippet", "")
+    )
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+        return data.get("prompt", "")
+    except (json.JSONDecodeError, KeyError):
+        return ""
 
-    # Browser API uses {"prompt": "..."} format (not messages array).
-    prompt = ""
-    if body:
-        try:
-            data = json.loads(body)
-            prompt = data.get("prompt", "")[:200]
-        except (json.JSONDecodeError, KeyError):
-            pass
 
-    return method, url, pid, proc, prompt
+def extract_model(req_event):
+    """Extract the model name from the request body."""
+    body = (
+        req_event.get("_merged_body", "")
+        or req_event.get("request_body", "")
+        or req_event.get("body_snippet", "")
+    )
+    if not body:
+        return ""
+    try:
+        data = json.loads(body)
+        return data.get("model", "")
+    except (json.JSONDecodeError, KeyError):
+        return ""
 
 
 def print_raw(events):
@@ -158,13 +177,20 @@ def print_raw(events):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Read browser (claude.ai) responses from traffic-agent events"
+    p = argparse.ArgumentParser(
+        description="Read browser (claude.ai) request and response from traffic-agent events"
     )
-    parser.add_argument("-f", "--file", default="events.json", help="Path to events.json")
-    parser.add_argument("--all", action="store_true", help="Show all responses, not just the last")
-    parser.add_argument("--raw", action="store_true", help="Show raw event details (before dedup)")
-    args = parser.parse_args()
+    p.add_argument("-f", "--file", default="stdout.jsonl",
+                   help="Path to NDJSON events file (default: stdout.jsonl)")
+    p.add_argument("--all", action="store_true",
+                   help="Show all turns, not just the last")
+    p.add_argument("--raw", action="store_true",
+                   help="Show raw event details")
+    p.add_argument("--request", action="store_true",
+                   help="Show the full request body (JSON)")
+    p.add_argument("--headers", action="store_true",
+                   help="Show request headers")
+    args = p.parse_args()
 
     try:
         events = load_events(args.file)
@@ -174,46 +200,79 @@ def main():
 
     groups = find_completion_groups(events)
 
-    if not groups:
-        print("No browser completion (POST /completion) groups found.")
-        sys.exit(0)
-
-    # Filter out empty groups (preflight/navigation requests with no SSE response).
+    # Filter out empty groups.
     groups = [(req, resp) for req, resp in groups if resp]
     if not groups:
-        print("No browser completion responses with SSE data found.")
+        print("No browser completion responses found.")
+        print(f"  (searched {len(events)} events in {args.file})")
         sys.exit(0)
 
     targets = groups if args.all else [groups[-1]]
 
-    for i, (req, resp_events) in enumerate(targets):
-        method, url, pid, proc, prompt = get_request_info(req)
-        n_raw = len(resp_events)
+    for idx, (req, resp_events) in enumerate(targets):
+        url = req.get("url", "?")
+        pid = req.get("pid", 0)
+        proc = req.get("process_name", "")
+        ts = req.get("timestamp", "")
+        prompt = extract_prompt(req)
+        model = extract_model(req)
+
         deduped = deduplicate(resp_events)
-        n_deduped = len(deduped)
         n_deltas = sum(
             1 for ev in deduped
             if "content_block_delta" in ev.get("body_snippet", "")
         )
 
         if len(targets) > 1:
-            print(f"{'=' * 60}")
-        print(f"Request: {method} {url}")
+            print(f"\n{'=' * 70}")
+            print(f"  Turn {idx + 1}/{len(targets)}")
+            print(f"{'=' * 70}")
+
+        # Request info.
+        print(f"\n--- REQUEST ---")
+        print(f"Time:    {ts}")
+        print(f"URL:     POST {url}")
         print(f"Process: {proc} (pid={pid})")
+        if model:
+            print(f"Model:   {model}")
         if prompt:
             print(f"Prompt:  {prompt}")
-        print(f"Events:  {n_raw} raw, {n_deduped} after dedup, {n_deltas} content tokens")
-        print(f"{'-' * 60}")
+
+        if args.headers:
+            headers = req.get("request_headers", {})
+            if headers:
+                print(f"\nHeaders:")
+                for k, v in sorted(headers.items()):
+                    # Truncate long values.
+                    v_display = v if len(v) <= 100 else v[:100] + "..."
+                    print(f"  {k}: {v_display}")
+
+        if args.request:
+            body = (
+                req.get("_merged_body", "")
+                or req.get("request_body", "")
+                or req.get("body_snippet", "")
+            )
+            if body:
+                try:
+                    formatted = json.dumps(json.loads(body), indent=2, ensure_ascii=False)
+                    print(f"\nRequest Body:\n{formatted}")
+                except json.JSONDecodeError:
+                    print(f"\nRequest Body (raw):\n{body}")
+
+        # Response info.
+        print(f"\n--- RESPONSE ---")
+        print(f"Events:  {len(resp_events)} raw, {len(deduped)} deduped, {n_deltas} content chunks")
 
         if args.raw:
             print_raw(resp_events)
-            print(f"{'-' * 60}")
 
         text = reconstruct_response(deduped)
         if text:
-            print(f"Response:\n{text}")
+            print(f"\n{text}")
         else:
-            print("(no SSE content_block_delta tokens found)")
+            print("(no response text found)")
+
         print()
 
 
