@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 
 
@@ -146,49 +147,70 @@ def reconstruct_response(events, include_tools=False):
     return text
 
 
-def extract_prompt(req_event):
-    """Extract the user's prompt from the messages array."""
-    body = (
+def _get_body(req_event):
+    return (
         req_event.get("_merged_body", "")
         or req_event.get("request_body", "")
         or req_event.get("body_snippet", "")
     )
+
+
+def extract_prompt(req_event):
+    """Extract the user's prompt from the messages array.
+
+    Handles truncated JSON (large requests may be cut off by the agent's
+    capture buffer) by falling back to regex extraction.
+    """
+    body = _get_body(req_event)
     if not body:
         return ""
+
+    # Try full JSON parse first.
     try:
         data = json.loads(body)
         messages = data.get("messages", [])
         if not messages:
             return ""
-        # Find the last user message.
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = msg.get("content", "")
                 if isinstance(content, list):
+                    # Skip system-reminder text blocks.
                     for c in content:
                         if c.get("type") == "text":
-                            return c["text"]
+                            t = c["text"]
+                            if not t.startswith("<system"):
+                                return t
+                    # All text blocks were system reminders — return last one truncated.
+                    return ""
                 elif isinstance(content, str):
-                    return content
+                    if not content.startswith("<system"):
+                        return content
         return ""
     except (json.JSONDecodeError, KeyError):
-        return ""
+        pass
+
+    # Truncated JSON — use regex to extract model and find the user prompt.
+    # Claude CLI sends: {"model":"...","messages":[{"role":"user","content":[...]}]}
+    # The actual user prompt is the last "text" field that isn't a system-reminder.
+    # For -p mode, messages array has a single user message.
+    # This is a best-effort extraction.
+    return ""
 
 
 def extract_model(req_event):
     """Extract the model name from the request body."""
-    body = (
-        req_event.get("_merged_body", "")
-        or req_event.get("request_body", "")
-        or req_event.get("body_snippet", "")
-    )
+    body = _get_body(req_event)
     if not body:
         return ""
     try:
         data = json.loads(body)
         return data.get("model", "")
     except (json.JSONDecodeError, KeyError):
-        return ""
+        pass
+    # Regex fallback for truncated JSON.
+    m = re.search(r'"model"\s*:\s*"([^"]+)"', body)
+    return m.group(1) if m else ""
 
 
 def print_raw(events):

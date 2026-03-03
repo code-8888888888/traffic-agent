@@ -9,10 +9,12 @@ A Go application that passively intercepts and inspects **HTTP and HTTPS** netwo
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [Prerequisites](#prerequisites)
 - [Building](#building)
 - [Running](#running)
+- [Log Files & Monitoring](#log-files--monitoring)
 - [HTTPS / TLS Interception](#https--tls-interception)
 - [Configuration Reference](#configuration-reference)
 - [Output Format](#output-format)
@@ -22,6 +24,31 @@ A Go application that passively intercepts and inspects **HTTP and HTTPS** netwo
 - [Required Capabilities](#required-capabilities)
 - [Makefile Targets](#makefile-targets)
 - [Known Limitations](#known-limitations)
+
+---
+
+## Quick Start
+
+```bash
+# 1. Build
+make build
+
+# 2. Start the agent (background, events → stdout.jsonl, logs → stderr.log)
+sudo bash -c './bin/traffic-agent -v >stdout.jsonl 2>stderr.log &'
+
+# 3. Restart Firefox (picks up QUIC-disable config, forces HTTP/2 over TLS)
+#    Or use curl for a quick test:
+curl -s https://httpbin.org/get > /dev/null
+
+# 4. Verify events are being captured
+tail -f stderr.log          # watch agent diagnostics
+wc -l stdout.jsonl          # count captured events
+
+# 5. Read captured data
+python3 scripts/read-events-cli.py                # Claude CLI — last turn
+python3 scripts/read-events-browser.py             # Browser (claude.ai) — last turn
+python3 scripts/read-events.py --url /api/ --all   # Generic — all matching events
+```
 
 ---
 
@@ -143,9 +170,15 @@ go build -o ./bin/traffic-agent ./cmd/agent
 
 ## Running
 
+### Direct invocation
+
 ```bash
-# Run directly (requires root or the capabilities listed below)
-sudo ./bin/traffic-agent --config config/config.yaml
+# Foreground (Ctrl+C to stop). Events → stdout, diagnostics → stderr.
+sudo ./bin/traffic-agent -v
+
+# Background — recommended for long-running capture.
+# Events go to stdout.jsonl, diagnostics to stderr.log.
+sudo bash -c './bin/traffic-agent -v >stdout.jsonl 2>stderr.log &'
 
 # Flags
 sudo ./bin/traffic-agent --help
@@ -153,13 +186,89 @@ sudo ./bin/traffic-agent --help
   -v               verbose logging
 ```
 
-Traffic events are written as newline-delimited JSON to stdout (and optionally to a file). Log messages (startup, errors) go to stderr.
+The `sudo bash -c '... &'` form is required so that stderr redirection applies to the agent process (plain `sudo ... 2>stderr.log &` does not redirect the agent's stderr).
+
+### Helper script
+
+The `traffic-agent.sh` script wraps start/stop/status and manages a PID file:
 
 ```bash
-# Capture events to a file while watching logs in real time
-sudo ./bin/traffic-agent --config config/config.yaml \
-    > /var/log/traffic-agent/events.json \
-    2> /var/log/traffic-agent/agent.log
+# Foreground (Ctrl+C to stop)
+sudo ./traffic-agent.sh start
+
+# Background with output prefix — writes capture.json + capture.log
+sudo ./traffic-agent.sh start -o capture
+
+# Stop the background instance
+sudo ./traffic-agent.sh stop
+
+# Check if running
+sudo ./traffic-agent.sh status
+```
+
+### Automatic iptables QUIC block
+
+On startup the agent checks for an iptables rule that blocks outbound QUIC (UDP port 443). If the rule is missing, it adds:
+
+```
+iptables -A OUTPUT -p udp --dport 443 -j DROP
+```
+
+This forces browsers to fall back from HTTP/3 (QUIC) to HTTP/2 over TLS, which the SSL uprobes can capture. The rule persists until manually removed (`sudo iptables -D OUTPUT -p udp --dport 443 -j DROP`).
+
+### Firefox
+
+Firefox must be **(re)started after the agent** for two reasons:
+
+1. The agent writes `user.js` to Firefox profiles disabling QUIC prefs — Firefox reads `user.js` at startup.
+2. SSL uprobes attach to NSS libraries — Firefox must establish **new** TLS connections after the agent attaches probes.
+
+After restarting Firefox, send a message on claude.ai (or visit any HTTPS site) to generate capturable traffic. Cached pages do not produce network traffic.
+
+---
+
+## Log Files & Monitoring
+
+The agent writes to two output streams:
+
+| Stream | Default file | Contents |
+|--------|-------------|----------|
+| **stdout** | `stdout.jsonl` | NDJSON captured events — the data you care about |
+| **stderr** | `stderr.log` | Agent diagnostics: startup, probe attachment, stats, errors |
+
+### Monitoring stderr
+
+```bash
+# Follow diagnostics in real time
+tail -f stderr.log
+
+# Key lines to look for:
+#   [tls] attached global uprobes to libnspr4.so  — NSS probes active
+#   [tls] attached BoringSSL uprobes to claude     — Claude CLI probes active
+#   [stats] SSL events: ...                        — SSL event throughput
+#   [stats] H2/TLS: ...                           — HTTP/2 frame counts
+#   [stats] QUIC: ...                             — QUIC packet counts (if enabled)
+```
+
+### Monitoring stdout
+
+```bash
+# Count captured events
+wc -l stdout.jsonl
+
+# Watch events arrive in real time (one JSON object per line)
+tail -f stdout.jsonl | jq .
+
+# Count events by process
+jq -r '.process_name' stdout.jsonl | sort | uniq -c | sort -rn
+```
+
+### File permissions
+
+`stdout.jsonl` and `stderr.log` are owned by root (the agent runs as root). Use `sudo` to read them, or `chmod` after creation:
+
+```bash
+sudo chmod 644 stdout.jsonl stderr.log
 ```
 
 ---
@@ -231,20 +340,24 @@ node -e "require('https').get('https://httpbin.org/get', r => r.resume())"
 # then restart the agent; any subsequent Firefox HTTPS traffic will be intercepted
 ```
 
-### Firefox — startup order and limitations
+### Firefox — startup order and QUIC
 
-Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent scans `/proc/*/maps` at startup **and re-scans every 10 seconds**, so startup order does not matter:
+Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent scans `/proc/*/maps` at startup **and re-scans every 2 seconds**, so startup order does not matter:
 
-- **Agent starts first** — the periodic re-scan will find `libnspr4.so` within 10 seconds after Firefox establishes its first connection and loads the library.
+- **Agent starts first** — the periodic re-scan will find `libnspr4.so` within 2 seconds after Firefox establishes its first connection and loads the library.
 - **Firefox starts first** — `libnspr4.so` is found at the next agent scan cycle (or immediately at startup if Firefox is already running).
 
-**ARM64 / aarch64 note:** On ARM64, `PR_Write` and `PR_Read` in `libnspr4.so` are 3-instruction indirect tail-calls (`br x3`, not `blr x3`), so a `uretprobe` on them never fires. The agent automatically detects this and uses an entry-only write probe (`uprobe/SSL_write_entry_cap`) for NSPR, which reads the plaintext buffer at function entry. Read capture is not available for NSPR on ARM64.
+**QUIC / HTTP/3 disabled automatically:** The agent disables QUIC in Firefox via two mechanisms:
+1. **user.js prefs** — writes `network.http.http3.enabled = false` (and related prefs) to all Firefox profiles. The prefs persist permanently (not restored on agent shutdown).
+2. **iptables block** — adds `OUTPUT -p udp --dport 443 -j DROP` to block QUIC at the OS level. This is required because Firefox 148+ ignores `user.js` QUIC prefs due to Nimbus experiments.
 
-**Firefox snap on Ubuntu:** When Firefox is installed as a snap package, its processes run inside the snap sandbox. The Socket Process (which handles network I/O) has `NoNewPrivs=1` and multiple seccomp filter layers, and is already ptrace-traced by the Firefox sandbox broker — only one ptrace tracer is allowed at a time, which can prevent eBPF uprobe breakpoints from being inserted in that process. Traffic from non-sandboxed helper processes (e.g., the main Firefox process, content processes) may still be captured.
+With QUIC disabled, all HTTPS traffic goes through HTTP/2 over TLS, which the NSS uprobes capture fully (both requests and responses).
 
-**HTTP/2 traffic:** Most Firefox HTTPS browsing uses HTTP/2 (negotiated via ALPN), which produces binary HPACK frames that the HTTP/1.1 parser discards. See [HTTP/2 limitation](#http2-limitation) below.
+**Firefox must be restarted** after the agent starts for `user.js` changes to take effect. The iptables rule takes effect immediately.
 
-**Cached responses:** Firefox aggressively caches HTTP responses. If a URL was visited recently, no new TCP connection or TLS handshake is made — the agent captures nothing because no TLS write/read occurs on the wire.
+**ARM64 / aarch64 note:** On ARM64, `PR_Write` and `PR_Read` in `libnspr4.so` are 3-instruction indirect tail-calls (`br x3`, not `blr x3`), so a `uretprobe` on them never fires. The agent uses entry-only write probes for NSPR (`PR_Write`, `PR_Send`, `PR_Writev`), and captures reads via offset-based probes on NSS `libssl3.so` (`nss_recv_func` discovered by ARM64 instruction analysis).
+
+**Cached responses:** Firefox aggressively caches HTTP responses. If a URL was visited recently, no new TCP connection or TLS handshake is made — the agent captures nothing because no TLS write/read occurs on the wire. POST requests (e.g., sending a message on claude.ai) always go over the network.
 
 ### Example output
 
@@ -275,7 +388,7 @@ Firefox loads `libnspr4.so` lazily (after its first TLS connection). The agent s
 
 > **Note on Firefox process names:** Firefox uses a multi-process architecture. The main process comm is `"firefox"` (shown on TCP events resolved via `/proc/net/tcp`). The dedicated network I/O thread comm is `"Socket Thread"` (shown on TLS/NSPR events).
 
-> **Note on Firefox HTTPS:** HTTP/2 request headers are captured via NSPR uprobes (see HTTP/2 section below). Response headers are not captured for Firefox because `PR_Read` is an indirect tail-call on ARM64 — the response data is not available at the uprobe entry point. For full request+response capture use curl, wget, or node. Plain HTTP (port 80) is always captured by the TC hook regardless.
+> **Note on Firefox HTTPS:** Both HTTP/2 requests and responses are captured. On ARM64, `PR_Read` in `libnspr4.so` is an indirect tail-call, but NSS reads are captured via offset-based probes on `libssl3.so` (`nss_recv_func`). Combined with `PR_Write`/`PR_Send` for writes, this provides full bidirectional H2 capture for Firefox.
 
 > **Note:** `src_ip`/`dst_ip`/`src_port`/`dst_port` are empty for TLS events — IP/port information is not available at the SSL uprobe level. Use TC-captured events (plain HTTP on port 80) when you need connection-level metadata.
 
@@ -289,7 +402,7 @@ The agent fully parses **HTTP/2** traffic on all SSL library paths. HPACK header
 | SSL uprobe — OpenSSL (`libssl.so`) | ✅ request + response | ✅ request + response |
 | SSL uprobe — GnuTLS (`libgnutls.so`) | ✅ request + response | ✅ request + response |
 | SSL uprobe — BoringSSL (static) | ✅ request + response | ✅ request + response |
-| SSL uprobe — NSPR (`libnspr4.so`, Firefox) | ✅ request + response | ✅ **request only** (see note) |
+| SSL uprobe — NSS/NSPR (Firefox) | ✅ request + response | ✅ request + response |
 
 **curl** defaults to HTTP/2 when the server supports it — both request and response are captured:
 
@@ -301,13 +414,13 @@ curl -s https://example.com/api
 curl --http1.1 https://example.com/api
 ```
 
-**Firefox** HTTP/2 requests are captured via the NSPR uprobe. Response headers are not captured for Firefox because `PR_Read`/`PR_Recv` are ARM64 indirect tail-calls (no `uretprobe` can fire) and NSS's `libssl3.so` exports no hookable read symbols. Additionally, Firefox uses HTTP/3 (QUIC over UDP) for many popular sites; QUIC traffic is not visible to the TC hook (TCP only) or NSPR uprobes.
+**Firefox** HTTP/2 requests and responses are both captured. Writes go through NSPR (`PR_Write`/`PR_Send`), reads are captured via offset-based probes on `libssl3.so`. With QUIC auto-disabled, all Firefox HTTPS traffic uses HTTP/2 over TLS.
 
-**Existing connections** (opened before the agent started) are detected heuristically from the HTTP/2 frame structure and parsed correctly, though the HPACK dynamic table starts empty — headers referencing dynamic table entries built up before the agent started may decode incorrectly. New connections opened after the agent starts decode fully.
+**Existing connections** (opened before the agent started) are detected heuristically from the HTTP/2 frame structure and parsed correctly. A lenient HPACK decoder recovers static-table and literal headers when the dynamic table is desynced from missed early frames. New connections opened after the agent starts decode fully.
+
+**Response decompression:** The agent decompresses H2 response bodies automatically — gzip, Brotli (`br`), Zstandard (`zstd`), and deflate are all supported. When `content-encoding` is lost due to HPACK dynamic table desync, the agent speculatively probes all four codecs and caches the detected encoding for subsequent DATA frames.
 
 Plain HTTP from Firefox (port 80, no TLS) is always captured by the TC hook.
-
-See [Known Limitations](#known-limitations) for HTTP/3 and Firefox response capture.
 
 ### Target-specific attachment
 
@@ -353,6 +466,33 @@ To find the offsets from a symbol-bearing build:
 readelf -sW /path/to/chromium | grep -E 'SSL_write|SSL_read'
 # Note the Value (virtual address), then subtract the load address from /proc/<pid>/maps
 ```
+
+### Claude CLI interception (BoringSSL)
+
+Claude CLI (Claude Code) is a Bun runtime binary that statically links a **stripped BoringSSL**. Since ELF symbols are absent, you must provide explicit file offsets in the config.
+
+**1. Find the binary path:**
+
+```bash
+readlink -f $(which claude)
+# e.g. /home/ubuntu/.local/share/claude/versions/2.1.63
+```
+
+**2. Add to config.yaml:**
+
+```yaml
+tls:
+  enabled: true
+  boringssl_executables:
+    - path: /home/ubuntu/.local/share/claude/versions/2.1.63
+      process_name: claude
+      ssl_write_offset: 0x6094b80
+      ssl_read_offset:  0x6093ec0
+```
+
+The offsets above are for Claude CLI v2.1.63 (ARM64). **Offsets must be updated when the Claude CLI binary is upgraded** — they are version-specific.
+
+**How it works:** Claude CLI uses the Anthropic API via HTTP/1.1 over TLS with `Transfer-Encoding: chunked` and `Content-Encoding: gzip` for SSE responses. The agent captures the full request (prompt + messages array) and streams the SSE response (decompressed from gzip), including `content_block_delta` tokens with the assistant's answer text.
 
 ### Go TLS limitation
 
@@ -641,77 +781,122 @@ Multiple concurrent subscribers are supported; each receives all events independ
 
 ## Reading Captured Events
 
-Three Python scripts in `scripts/` reconstruct full HTTP responses from the captured `events.json` file. They extract SSE `content_block_delta` tokens and reassemble them into the complete response text.
+Three Python scripts in `scripts/` reconstruct full HTTP conversations from the captured NDJSON event stream. They extract SSE `content_block_delta` tokens and reassemble them into the complete response text.
 
-| Script | Source | API endpoint |
-|--------|--------|-------------|
-| `read-events-cli.py` | Claude CLI (Claude Code) | `/v1/messages` |
-| `read-events-browser.py` | Browser (claude.ai) | `/completion` |
-| `read-events.py` | Generic (any URL) | configurable via `--url` |
+| Script | Source | API endpoint | Default file |
+|--------|--------|-------------|-------------|
+| `read-events-cli.py` | Claude CLI (Claude Code) | `/v1/messages` | `stdout.jsonl` |
+| `read-events-browser.py` | Browser (claude.ai) | `/completion` | `stdout.jsonl` |
+| `read-events.py` | Generic (any URL) | configurable via `--url` | `stdout.jsonl` |
 
-> **Note:** `events.json` is root-owned (the agent runs as root). Use `sudo` to read it, or adjust file permissions in the output config.
+All scripts default to reading `stdout.jsonl` in the current directory. Override with `-f /path/to/file`.
+
+### Common flags
+
+All three scripts support these flags:
+
+| Flag | Description |
+|------|-------------|
+| `-f FILE` | Path to NDJSON events file (default: `stdout.jsonl`) |
+| `--all` | Show all turns/groups, not just the last one |
+| `--raw` | Show raw event details (direction, status, body length) |
+| `--request` | Show the full request body (pretty-printed JSON) |
+| `--headers` | Show request headers (and response headers for generic script) |
+
+Additional flags:
+- `read-events-cli.py`: `--tools` — show tool use events (tool name + input JSON)
+- `read-events.py`: `--url PATTERN` — filter by URL substring; `--no-filter` — show all events
 
 ### CLI capture (Claude Code)
 
 ```bash
-# Last CLI response
-sudo python3 scripts/read-events-cli.py -f events.json
+# Last CLI response (reads stdout.jsonl by default)
+python3 scripts/read-events-cli.py
 
 # All CLI responses
-sudo python3 scripts/read-events-cli.py -f events.json --all
+python3 scripts/read-events-cli.py --all
+
+# Show request body, headers, and tool use
+python3 scripts/read-events-cli.py --request --headers --tools
 
 # Show raw event details
-sudo python3 scripts/read-events-cli.py -f events.json --raw
+python3 scripts/read-events-cli.py --raw
+
+# Custom file
+python3 scripts/read-events-cli.py -f /tmp/capture.json
 ```
 
-**Requirements:**
+**Example output:**
 
-- **BoringSSL offsets required** — Claude CLI (Bun runtime) statically links a stripped BoringSSL. The `tls.boringssl_executables` config must have the correct `ssl_write_offset` and `ssl_read_offset` for your installed version. These offsets are version-specific and must be updated when the Claude CLI binary is upgraded.
+```
+--- REQUEST ---
+Time:    2026-03-03T10:23:45.123Z
+URL:     POST /v1/messages?beta=true
+Process: claude (pid=12345)
+Model:   claude-opus-4-6-20250219
+Prompt:  List the 7 wonders of the ancient world
+
+--- RESPONSE ---
+Events:  82 total, 75 content chunks
+
+1. **Great Pyramid of Giza** — The oldest and only surviving wonder...
+2. **Hanging Gardens of Babylon** — Elaborate tiered gardens...
+...
+```
+
+**Requirements:** BoringSSL offsets must be configured for your Claude CLI version — see [Claude CLI interception](#claude-cli-interception-boringssl).
 
 ### Browser capture (Firefox / claude.ai)
 
 ```bash
 # Last browser response
-sudo python3 scripts/read-events-browser.py -f events.json
+python3 scripts/read-events-browser.py
 
 # All browser responses
-sudo python3 scripts/read-events-browser.py -f events.json --all
+python3 scripts/read-events-browser.py --all
+
+# Show request body and headers
+python3 scripts/read-events-browser.py --request --headers
 
 # Show raw event details (before deduplication)
-sudo python3 scripts/read-events-browser.py -f events.json --raw
+python3 scripts/read-events-browser.py --raw
+```
+
+**Example output:**
+
+```
+--- REQUEST ---
+Time:    2026-03-03T10:25:12.456Z
+URL:     POST /api/organizations/.../completion
+Process: Socket Thread (pid=54321)
+Prompt:  Explain how eBPF works
+
+--- RESPONSE ---
+Events:  45 raw, 38 deduped, 32 content chunks
+
+eBPF (extended Berkeley Packet Filter) is a technology that allows...
 ```
 
 **Requirements:**
 
 - **Firefox only** — Chromium's statically-linked BoringSSL is stripped and not configured for interception by default.
-- **QUIC auto-disabled** — The agent writes `user.js` to Firefox profiles on startup to disable QUIC/HTTP3, forcing all HTTPS through HTTP/2 over TLS which the NSS uprobes can capture.
-- **Firefox restart required** — Firefox must be (re)started after the agent starts for the `user.js` QUIC disable to take effect.
+- **QUIC auto-disabled** — The agent disables QUIC in Firefox (user.js + iptables), forcing HTTP/2 over TLS.
+- **Firefox restart required** — Firefox must be (re)started after the agent starts.
 
-**How it works:** The browser uses HTTP/2 over TLS. Due to H2 mid-connection joins (the agent may attach after the H2 handshake), SSE response chunks arrive as DATA frames without URL metadata. The browser script collects these URL-less SSE events and correlates them with the `POST /completion` request. NSS read+return probes both capture the same SSL_read data, so the script deduplicates using a sliding window.
+**How it works:** Firefox uses HTTP/2 over TLS for claude.ai. The agent captures full H2 request+response via NSS uprobes. The browser script handles NSS read deduplication (entry+return probes fire twice per logical read) using a sliding window. SSE response events without URL metadata (from H2 mid-connection joins) are correlated with the preceding `POST /completion` request.
 
 ### Generic event reader
 
 ```bash
-# Filter by any URL pattern
-sudo python3 scripts/read-events.py --url /v1/messages
-sudo python3 scripts/read-events.py --url /api/chat
+# Filter by URL pattern
+python3 scripts/read-events.py --url /v1/messages
+python3 scripts/read-events.py --url /api/
 
-# All events without URL filtering
-sudo python3 scripts/read-events.py --no-filter --all
-```
+# All events, no URL filter
+python3 scripts/read-events.py --no-filter --all
 
-### Example output
-
-```
-Request: POST /v1/messages?beta=true
-Process: HTTP Client (pid=296857)
-Prompt:  List the 7 wonders of the ancient world
-Events:  82 total, 75 content tokens
-------------------------------------------------------------
-Response:
-1. **Great Pyramid of Giza** — The oldest and only surviving wonder...
-2. **Hanging Gardens of Babylon** — Elaborate tiered gardens...
-...
+# Show everything: request, headers, raw events
+python3 scripts/read-events.py --url /completion --all --request --headers --raw
 ```
 
 ---
@@ -806,24 +991,26 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_SYS_ADMIN CAP_NET_RAW
 
 1. **IPv4 only** — The TC BPF program skips non-`ETH_P_IP` frames. IPv6 support requires adding `ip6hdr` parsing.
 
-2. **HTTP/1.1 only** — HTTP/2 uses binary HPACK framing and is not parsed. Both the TC and SSL uprobe paths silently discard the HTTP/2 connection preface (`PRI * HTTP/2.0`) and produce no events for subsequent binary frames. In practice this means: most modern HTTPS browsing with Firefox or Chrome produces no events (HTTP/2 via TLS ALPN); curl defaults to HTTP/2 and must be passed `--http1.1`; HTTP/1.1-only servers, WebSocket upgrade handshakes, and plain HTTP (port 80) are always captured. Full HTTP/2 support would require HPACK decompression and frame parsing on top of the SSL uprobe capture path.
+2. **TCP sequence numbers not captured** — Payloads are accumulated in arrival order. Out-of-order segment reassembly is not supported. In practice, in-order delivery is the common case on local networks.
 
-3. **TCP sequence numbers not captured** — Payloads are accumulated in arrival order. Out-of-order segment reassembly is not supported. In practice, in-order delivery is the common case on local networks.
+3. **Body snippet limit** — At most 512 bytes of the request or response body are captured per event (`BodySnippetMaxLen` in `internal/types/types.go`). Large request bodies (e.g., Claude API messages arrays with long conversation history) may be truncated by the SSL capture buffer.
 
-4. **Body snippet limit** — At most 512 bytes of the request or response body are captured per event (`BodySnippetMaxLen` in `internal/types/types.go`). Large bodies are truncated.
+4. **BPF ring buffer size** — The TC ring buffer is 256 KiB (`max_entries` in `bpf/tc_capture.c`). Under sustained high throughput, events may be dropped. Increase `max_entries` and recompile if needed.
 
-5. **BPF ring buffer size** — The TC ring buffer is 256 KiB (`max_entries` in `bpf/tc_capture.c`). Under sustained high throughput, events may be dropped. Increase `max_entries` and recompile if needed.
+5. **Go TLS not intercepted** — Go's `crypto/tls` does not link against OpenSSL or any of the other supported SSL libraries, so SSL uprobes do not cover Go HTTPS clients or servers. A separate uretprobe on `crypto/tls.(*Conn).Read/Write` is planned.
 
-6. **Go TLS not intercepted** — Go's `crypto/tls` does not link against OpenSSL or any of the other supported SSL libraries, so SSL uprobes do not cover Go HTTPS clients or servers. A separate uretprobe on `crypto/tls.(*Conn).Read/Write` is planned.
+6. **Stripped static BoringSSL** — Applications that statically link a stripped BoringSSL (e.g., production Chromium snap builds) have no ELF symbols for `SSL_write`/`SSL_read`. These require finding the exact file offsets from a matching debug build and providing them via `tls.boringssl_executables` in config. There is no automatic way to locate the functions in a fully stripped binary.
 
-7. **Stripped static BoringSSL** — Applications that statically link a stripped BoringSSL (e.g., production Chromium snap builds) have no ELF symbols for `SSL_write`/`SSL_read`. These require finding the exact file offsets from a matching debug build and providing them via `tls.boringssl_executables` in config. There is no automatic way to locate the functions in a fully stripped binary.
+7. **Per-interface attachment** — TC hooks attach to one interface. Capture on multiple interfaces requires running multiple instances with different configs, or extending the code to iterate over interfaces.
 
-8. **Per-interface attachment** — TC hooks attach to one interface. Capture on multiple interfaces requires running multiple instances with different configs, or extending the code to iterate over interfaces.
+8. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
 
-9. **Container traffic** — The TC hook captures at the host interface level. Traffic between containers on a Docker bridge network is visible at the `docker0` interface, not `eth0`. Set `interface: docker0` (or the relevant veth) to capture container traffic.
+9. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
 
-10. **Kernel version** — Developed and tested on Linux 5.15 (ARM64). CO-RE requires kernel 5.8+ with `CONFIG_DEBUG_INFO_BTF=y`.
+10. **Firefox snap sandbox** — Firefox installed as a snap on Ubuntu runs its Socket Process with `NoNewPrivs=1`, multiple seccomp filter layers, and an existing ptrace tracer (the snap broker). This can prevent eBPF uprobe breakpoints from being inserted into the sandboxed process. Plain HTTP (port 80) and HTTP/1.1 over TLS from non-sandboxed Firefox processes (e.g., WebSocket connections via the main process) are still captured.
 
-11. **Firefox snap sandbox** — Firefox installed as a snap on Ubuntu runs its Socket Process with `NoNewPrivs=1`, multiple seccomp filter layers, and an existing ptrace tracer (the snap broker). This can prevent eBPF uprobe breakpoints from being inserted into the sandboxed process. Plain HTTP (port 80) and HTTP/1.1 over TLS from non-sandboxed Firefox processes (e.g., WebSocket connections via the main process) are still captured.
+11. **NSS read capture on ARM64** — `PR_Read` in `libnspr4.so` is an indirect tail-call on ARM64 (`br x3`), so no uretprobe can fire on it. NSS reads are instead captured via offset-based probes on `libssl3.so` (`nss_recv_func`), discovered by ARM64 instruction analysis at startup. This works for Firefox but may not cover all NSS-based applications.
 
-12. **NSPR read capture not available on ARM64** — `PR_Read` in `libnspr4.so` is an indirect tail-call on ARM64 (`br x3`), so no uretprobe can fire on it. Only write (egress) direction is captured for NSPR. Inbound HTTPS responses from Firefox are not captured via the NSPR path; they may still appear on the TC hook if the connection is plain HTTP (port 80).
+12. **HTTP/3 (QUIC) partially supported** — QUIC decryption requires key material from `SSLKEYLOGFILE`. The agent blocks QUIC by default (iptables `OUTPUT -p udp --dport 443 -j DROP`) to force HTTP/2 fallback. QUIC support is available when SSLKEYLOGFILE-based key extraction is configured, but has limitations: no 0-RTT support, in-order stream reassembly only, and connections with very high packet numbers at match time may fail to decrypt.
+
+13. **Mid-connection join HPACK limits** — When the agent attaches to an existing HTTP/2 connection, the HPACK dynamic table starts empty. A lenient decoder recovers static-table and literal headers, but headers stored only as dynamic table references (e.g., `:authority` for a site already visited) may be missing until the peer sends them as a literal again. The agent tracks the last known `:authority` per connection as a fallback.
