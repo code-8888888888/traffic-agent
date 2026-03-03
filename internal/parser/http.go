@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"log"
@@ -46,6 +47,8 @@ var (
 	sslBodyHits        atomic.Int64 // SSL events with notable HTTP content
 	sseStreamsCreated   atomic.Int64
 	sseChunksEmitted   atomic.Int64
+	wsConnsCreated     atomic.Int64
+	wsFramesParsed     atomic.Int64
 )
 
 // sslContentPatterns are substrings scanned in raw SSL event data for diagnostics.
@@ -108,6 +111,28 @@ type sseStream struct {
 	updated         time.Time
 }
 
+// wsConn tracks an active WebSocket connection (post HTTP 101 upgrade).
+type wsConn struct {
+	url         string
+	host        string
+	processName string
+	deflate     bool // permessage-deflate negotiated
+	// Per-direction reassembly for fragmented messages (FIN=0)
+	readBuf     []byte // server→client fragments
+	writeBuf    []byte // client→server fragments
+	readOpcode  byte   // opcode from first fragment
+	writeOpcode byte
+	updated     time.Time
+}
+
+// wsFrame is a parsed WebSocket frame (RFC 6455).
+type wsFrame struct {
+	fin     bool
+	rsv1    bool
+	opcode  byte
+	payload []byte
+}
+
 type flowBuf struct {
 	data          []byte
 	updated       time.Time
@@ -124,6 +149,7 @@ type Parser struct {
 	h2cFlows   map[flowKey]bool           // TC flows identified as h2c (fast lookup)
 	sslReqMeta map[sslConnKey]*sslRequestMeta // last request per SSL conn (for SSE correlation)
 	sseStreams map[sslConnKey]*sseStream       // active SSE response streams
+	wsConns    map[sslConnKey]*wsConn          // active WebSocket connections
 }
 
 // New creates a Parser that will call sink for each parsed HTTP event.
@@ -136,6 +162,7 @@ func New(sink EventSink) *Parser {
 		h2cFlows:   make(map[flowKey]bool),
 		sslReqMeta: make(map[sslConnKey]*sslRequestMeta),
 		sseStreams: make(map[sslConnKey]*sseStream),
+		wsConns:    make(map[sslConnKey]*wsConn),
 	}
 }
 
@@ -286,6 +313,21 @@ func (p *Parser) HandleSSLEvent(ev *types.SSLEvent) {
 		connKey := h2ConnKey{PID: ev.PID, ConnID: ev.ConnID}
 		p.handleH2Event(h2State, ev.Data, ev.IsRead, meta, connKey)
 		return
+	}
+
+	// ---- WebSocket frame routing ----
+	//
+	// If this SSL connection has been upgraded to WebSocket (HTTP 101),
+	// route all subsequent data through the WebSocket frame parser.
+	{
+		ck := sslConnKey{PID: ev.PID, ConnID: ev.ConnID}
+		p.mu.Lock()
+		ws := p.wsConns[ck]
+		p.mu.Unlock()
+		if ws != nil {
+			p.handleWSEvent(ws, ev)
+			return
+		}
 	}
 
 	// ---- SSE stream continuation check ----
@@ -443,6 +485,29 @@ func (p *Parser) emitSSLEventWithTracking(te *types.TrafficEvent, ev *types.SSLE
 		p.mu.Unlock()
 	}
 
+	if ev.IsRead && te.StatusCode == 101 {
+		// Check if this response is a WebSocket upgrade.
+		upgrade := strings.ToLower(te.ResponseHeaders["Upgrade"])
+		if upgrade == "websocket" {
+			p.mu.Lock()
+			extensions := te.ResponseHeaders["Sec-Websocket-Extensions"]
+			ws := &wsConn{
+				processName: ev.ProcessName,
+				deflate:     strings.Contains(strings.ToLower(extensions), "permessage-deflate"),
+				updated:     time.Now(),
+			}
+			if reqMeta := p.sslReqMeta[ck]; reqMeta != nil {
+				ws.url = reqMeta.url
+				ws.host = reqMeta.host
+			}
+			p.wsConns[ck] = ws
+			p.mu.Unlock()
+			wsConnsCreated.Add(1)
+			log.Printf("[ws] connection established pid=%d conn=0x%x url=%s deflate=%v",
+				ev.PID, ev.ConnID, ws.url, ws.deflate)
+		}
+	}
+
 	if ev.IsRead && te.StatusCode > 0 {
 		// Check if this response starts an SSE stream.
 		ct := te.ResponseHeaders["Content-Type"]
@@ -492,6 +557,11 @@ func (p *Parser) emitSSLEventWithTracking(te *types.TrafficEvent, ev *types.SSLE
 // SSEStreamStats returns SSE diagnostic counters.
 func SSEStreamStats() (streams, chunks int64) {
 	return sseStreamsCreated.Load(), sseChunksEmitted.Load()
+}
+
+// WSStats returns WebSocket diagnostic counters.
+func WSStats() (conns, frames int64) {
+	return wsConnsCreated.Load(), wsFramesParsed.Load()
 }
 
 // tryParseSSLData attempts to parse data as an HTTP/1.1 request or response
@@ -566,6 +636,11 @@ func (p *Parser) FlushExpired(flowTimeout, h2Timeout time.Duration) {
 	for key, sse := range p.sseStreams {
 		if sse.updated.Before(flowCutoff) {
 			delete(p.sseStreams, key)
+		}
+	}
+	for key, ws := range p.wsConns {
+		if ws.updated.Before(flowCutoff) {
+			delete(p.wsConns, key)
 		}
 	}
 	h2Expired := 0
@@ -790,6 +865,187 @@ func (p *Parser) initH2CMidConnection(key flowKey, data []byte, ev *types.RawPac
 		Protocol:    "TCP",
 	}
 	p.handleH2Event(state, data, isRead, meta, connKey)
+}
+
+// ---- WebSocket frame handling ----
+
+// handleWSEvent processes SSL data on a WebSocket connection.  It parses
+// RFC 6455 frames, handles XOR unmasking, permessage-deflate decompression,
+// and fragment reassembly, emitting a TrafficEvent for each complete text
+// or binary message.
+func (p *Parser) handleWSEvent(ws *wsConn, ev *types.SSLEvent) {
+	// Client→server frames are masked (MASK=1); server→client are not.
+	masked := !ev.IsRead
+	frames := parseWSFrames(ev.Data, masked)
+
+	p.mu.Lock()
+	ws.updated = time.Now()
+	p.mu.Unlock()
+
+	for _, f := range frames {
+		// Skip control frames (close=8, ping=9, pong=10).
+		if f.opcode >= 8 {
+			continue
+		}
+		wsFramesParsed.Add(1)
+
+		// Fragment reassembly: opcode 0 = continuation frame.
+		p.mu.Lock()
+		if f.opcode == 0 {
+			// Continuation of a fragmented message.
+			if ev.IsRead {
+				ws.readBuf = append(ws.readBuf, f.payload...)
+				if f.fin {
+					f.payload = ws.readBuf
+					f.opcode = ws.readOpcode
+					f.rsv1 = false // RSV1 only set on first fragment
+					ws.readBuf = nil
+				} else {
+					p.mu.Unlock()
+					continue
+				}
+			} else {
+				ws.writeBuf = append(ws.writeBuf, f.payload...)
+				if f.fin {
+					f.payload = ws.writeBuf
+					f.opcode = ws.writeOpcode
+					f.rsv1 = false
+					ws.writeBuf = nil
+				} else {
+					p.mu.Unlock()
+					continue
+				}
+			}
+		} else if !f.fin {
+			// First fragment of a multi-frame message.
+			if ev.IsRead {
+				ws.readBuf = append(ws.readBuf[:0], f.payload...)
+				ws.readOpcode = f.opcode
+			} else {
+				ws.writeBuf = append(ws.writeBuf[:0], f.payload...)
+				ws.writeOpcode = f.opcode
+			}
+			p.mu.Unlock()
+			continue
+		}
+		deflate := ws.deflate
+		p.mu.Unlock()
+
+		payload := f.payload
+
+		// permessage-deflate: RSV1=1 means the message is DEFLATE-compressed.
+		// With no_context_takeover, each message is independently compressed.
+		if f.rsv1 && deflate {
+			// Append the DEFLATE flush marker (RFC 7692 §7.2.2).
+			compressed := make([]byte, len(payload)+4)
+			copy(compressed, payload)
+			compressed[len(payload)] = 0x00
+			compressed[len(payload)+1] = 0x00
+			compressed[len(payload)+2] = 0xff
+			compressed[len(payload)+3] = 0xff
+			fr := flate.NewReader(bytes.NewReader(compressed))
+			decompressed, err := io.ReadAll(io.LimitReader(fr, int64(types.RequestBodyMaxLen)))
+			fr.Close()
+			if err != nil && len(decompressed) == 0 {
+				log.Printf("[ws] deflate error pid=%d conn=0x%x: %v", ev.PID, ev.ConnID, err)
+				continue
+			}
+			payload = decompressed
+		}
+
+		// Only emit text (opcode=1) and binary (opcode=2) messages.
+		if f.opcode != 1 && f.opcode != 2 {
+			continue
+		}
+
+		direction := "ingress"
+		if !ev.IsRead {
+			direction = "egress"
+		}
+
+		snippet := string(payload)
+		if len(snippet) > types.BodySnippetMaxLen {
+			snippet = snippet[:types.BodySnippetMaxLen]
+		}
+
+		p.sink(&types.TrafficEvent{
+			Timestamp:      time.Now(),
+			Protocol:       "TLS",
+			Direction:      direction,
+			PID:            ev.PID,
+			ProcessName:    ws.processName,
+			HTTPMethod:     "WS",
+			URL:            ws.url,
+			BodySnippet:    snippet,
+			TLSIntercepted: true,
+		})
+	}
+}
+
+// parseWSFrames parses one or more RFC 6455 WebSocket frames from data.
+// If masked is true, payloads are XOR-unmasked. Incomplete trailing frames
+// are silently dropped (in practice SSL records align with WS frames).
+func parseWSFrames(data []byte, masked bool) []wsFrame {
+	var frames []wsFrame
+	for len(data) >= 2 {
+		b0 := data[0]
+		b1 := data[1]
+		fin := b0&0x80 != 0
+		rsv1 := b0&0x40 != 0
+		opcode := b0 & 0x0F
+		hasMask := b1&0x80 != 0
+		payloadLen := uint64(b1 & 0x7F)
+		off := 2
+
+		if payloadLen == 126 {
+			if len(data) < off+2 {
+				break
+			}
+			payloadLen = uint64(binary.BigEndian.Uint16(data[off : off+2]))
+			off += 2
+		} else if payloadLen == 127 {
+			if len(data) < off+8 {
+				break
+			}
+			payloadLen = binary.BigEndian.Uint64(data[off : off+8])
+			off += 8
+		}
+
+		var maskKey [4]byte
+		if hasMask {
+			if len(data) < off+4 {
+				break
+			}
+			copy(maskKey[:], data[off:off+4])
+			off += 4
+		}
+
+		if uint64(len(data)-off) < payloadLen {
+			break // incomplete frame
+		}
+
+		payload := make([]byte, payloadLen)
+		copy(payload, data[off:off+int(payloadLen)])
+
+		// XOR unmask if needed. The actual mask bit in the frame takes
+		// precedence over the caller's hint (client frames should be masked
+		// per spec, but we handle both directions).
+		if hasMask {
+			for i := range payload {
+				payload[i] ^= maskKey[i%4]
+			}
+		}
+
+		frames = append(frames, wsFrame{
+			fin:     fin,
+			rsv1:    rsv1,
+			opcode:  opcode,
+			payload: payload,
+		})
+		off += int(payloadLen)
+		data = data[off:]
+	}
+	return frames
 }
 
 func (p *Parser) deleteBuf(key flowKey) {

@@ -211,8 +211,9 @@ func main() {
 						h2df, h2he, h2ee, h2wr, h2sd)
 				}
 				sseStreams, sseChunks := parser.SSEStreamStats()
-				if sseStreams > 0 || sseChunks > 0 {
-					log.Printf("[stats] SSE: streams=%d chunks=%d", sseStreams, sseChunks)
+				wsConns, wsFrames := parser.WSStats()
+				if sseStreams > 0 || sseChunks > 0 || wsConns > 0 || wsFrames > 0 {
+					log.Printf("[stats] SSE: streams=%d chunks=%d ws_conns=%d ws_frames=%d", sseStreams, sseChunks, wsConns, wsFrames)
 				}
 				mcj, hexp, ldc := parser.H2StateStats()
 				if mcj > 0 || hexp > 0 || ldc > 0 {
